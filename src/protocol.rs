@@ -66,6 +66,19 @@ pub enum Command {
     Unreact { room: String, reaction_id: String },
     /// Tell the room we are typing (or stopped).
     Typing { room: String, typing: bool },
+    /// Details for a room's info panel.
+    RoomDetails { room: String },
+    /// Joined members, optionally filtered by name, most powerful first.
+    Members {
+        room: String,
+        #[serde(default)]
+        query: String,
+        #[serde(default = "default_members_limit")]
+        limit: u32,
+    },
+    /// Fetch an avatar (a user's or a room's mxc:// URL) into the media cache
+    /// as a small square; returns `{path}`.
+    Avatar { url: String },
     /// Mark the room read up to the given event: public read receipt plus
     /// the fully-read marker, so every client and device agrees.
     MarkRead { room: String, event_id: String },
@@ -150,6 +163,10 @@ fn default_search_limit() -> u32 {
 
 fn default_true() -> bool {
     true
+}
+
+fn default_members_limit() -> u32 {
+    200
 }
 
 #[derive(Debug, Serialize)]
@@ -298,6 +315,9 @@ pub struct RoomInfo {
     pub topic: Option<String>,
     pub encrypted: bool,
     pub direct: bool,
+    /// Room avatar (for a DM, the other person's), as an mxc:// URL.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub avatar: Option<String>,
     /// Messages after our read receipt, as counted locally: drops as you read.
     pub unread: u64,
     /// Mentions / keyword hits among those.
@@ -323,6 +343,8 @@ pub struct Message {
     pub event_id: String,
     pub sender: String,
     pub sender_name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sender_avatar: Option<String>,
     pub body: String,
     /// The HTML rendering when the sender provided one (formatted_body,
     /// org.matrix.custom.html); clients fall back to `body`.
@@ -405,6 +427,41 @@ pub struct ReceiptInfo {
     /// Users whose read receipt moved, and the event it now points at.
     pub event_id: String,
     pub users: Vec<UserRef>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RoomDetails {
+    pub id: String,
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub topic: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub avatar: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub alias: Option<String>,
+    pub encrypted: bool,
+    pub direct: bool,
+    /// public | invite | knock | restricted | other
+    pub join_rule: String,
+    pub member_count: u64,
+    /// What we may do here.
+    pub can_invite: bool,
+    pub can_kick: bool,
+    pub can_ban: bool,
+    pub can_set_name: bool,
+    pub can_set_topic: bool,
+    pub can_redact_other: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MemberInfo {
+    pub id: String,
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub avatar: Option<String>,
+    pub power: i64,
+    /// admin | moderator | member
+    pub role: String,
 }
 
 #[derive(Debug, Clone, Serialize)]

@@ -64,9 +64,9 @@ use tracing::{info, warn};
 use url::Url;
 
 use crate::protocol::{
-    Command, DirectoryRoom, DirectoryUser, Event, InviteInfo, Message, MessageEdit, Reaction, ReactionEvent,
-    ReactionSender, ReceiptInfo, Redaction, ReplyPreview, Request, Response, RoomInfo, Status, TimelinePage,
-    TypingInfo, UserRef,
+    Command, DirectoryRoom, DirectoryUser, Event, InviteInfo, MemberInfo, Message, MessageEdit, Reaction,
+    ReactionEvent, ReactionSender, ReceiptInfo, Redaction, ReplyPreview, Request, Response, RoomDetails, RoomInfo,
+    Status, TimelinePage, TypingInfo, UserRef,
 };
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -248,6 +248,12 @@ impl Core {
                 let r = self.room(&room).await?;
                 r.typing_notice(typing).await.context("typing notice")?;
                 Ok(json!({}))
+            }
+            Command::RoomDetails { room } => Ok(serde_json::to_value(self.room_details(&room).await?)?),
+            Command::Members { room, query, limit } => Ok(serde_json::to_value(self.members(&room, &query, limit).await?)?),
+            Command::Avatar { url } => {
+                let path = self.avatar(&url).await?;
+                Ok(json!({ "path": path }))
             }
             Command::MarkRead { room, event_id } => {
                 self.mark_read(&room, &event_id).await?;
@@ -760,6 +766,7 @@ impl Core {
             topic: room.topic(),
             encrypted,
             direct: room.is_direct().await.unwrap_or(false),
+            avatar: room.avatar_url().map(|u| u.to_string()),
             unread,
             highlights: room.num_unread_mentions().max(counts.highlight_count),
             notifications: counts.notification_count,
@@ -945,6 +952,30 @@ impl Core {
                 }
                 Some(m)
             }
+            // Joins, leaves, invites, kicks, name changes: small system lines.
+            AnySyncTimelineEvent::State(matrix_sdk::ruma::events::AnySyncStateEvent::RoomMember(
+                matrix_sdk::ruma::events::SyncStateEvent::Original(m),
+            )) => {
+                let text = membership_line(room, &m).await?;
+                Some(Message {
+                    room: room.room_id().to_string(),
+                    event_id: m.event_id.to_string(),
+                    sender: m.sender.to_string(),
+                    sender_name: String::new(),
+                    sender_avatar: None,
+                    body: text,
+                    html: None,
+                    msgtype: "system".to_owned(),
+                    ts: m.origin_server_ts.0.into(),
+                    encrypted: false,
+                    attachment: None,
+                    reply_to: None,
+                    edited: false,
+                    reactions: Vec::new(),
+                    read_by: Vec::new(),
+                    deleted: false,
+                })
+            }
             // A redacted message keeps its place with empty content — in an
             // encrypted room the shell that remains is an m.room.encrypted.
             AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::RoomMessage(
@@ -967,6 +998,7 @@ impl Core {
                     event_id: enc.event_id.to_string(),
                     sender: enc.sender.to_string(),
                     sender_name,
+                    sender_avatar: None,
                     body: "Unable to decrypt this message".to_owned(),
                     html: None,
                     msgtype: "unable_to_decrypt".to_owned(),
@@ -1155,9 +1187,9 @@ async fn invite_info(room: &Room) -> InviteInfo {
 }
 
 async fn to_message(room: &Room, ev: OriginalSyncRoomMessageEvent, encrypted: bool) -> Message {
-    let sender_name = match room.get_member_no_sync(&ev.sender).await {
-        Ok(Some(m)) => m.name().to_owned(),
-        _ => ev.sender.localpart().to_owned(),
+    let (sender_name, sender_avatar) = match room.get_member_no_sync(&ev.sender).await {
+        Ok(Some(m)) => (m.name().to_owned(), m.avatar_url().map(|u| u.to_string())),
+        _ => (ev.sender.localpart().to_owned(), None),
     };
     let html = formatted_html(&ev.content.msgtype);
     let reply_to = match &ev.content.relates_to {
@@ -1171,6 +1203,7 @@ async fn to_message(room: &Room, ev: OriginalSyncRoomMessageEvent, encrypted: bo
         event_id: ev.event_id.to_string(),
         sender: ev.sender.to_string(),
         sender_name,
+        sender_avatar,
         body,
         html,
         msgtype: ev.content.msgtype.msgtype().to_owned(),
@@ -1201,6 +1234,7 @@ async fn deleted_placeholder(
         event_id: event_id.to_string(),
         sender: sender.to_string(),
         sender_name,
+        sender_avatar: None,
         body: String::new(),
         html: None,
         msgtype: "m.text".to_owned(),
@@ -1320,6 +1354,157 @@ async fn on_receipt(event: SyncReceiptEvent, room: Room, client: Client, ctx: Ct
     }
     for (event_id, users) in by_event {
         let _ = ctx.events.send(Event::Receipt(ReceiptInfo { room: room.room_id().to_string(), event_id, users }));
+    }
+}
+
+/// "X joined", "X left", … for a member event, or None for changes not worth a line.
+async fn membership_line(room: &Room, ev: &matrix_sdk::ruma::events::room::member::OriginalSyncRoomMemberEvent) -> Option<String> {
+    use matrix_sdk::ruma::events::room::member::MembershipChange as C;
+    let who = |name: &Option<String>, id: &matrix_sdk::ruma::UserId| name.clone().unwrap_or_else(|| id.localpart().to_owned());
+    let target_name = ev.content.displayname.clone();
+    let target = who(&target_name, &ev.state_key);
+    let sender_name = match room.get_member_no_sync(&ev.sender).await {
+        Ok(Some(m)) => m.name().to_owned(),
+        _ => ev.sender.localpart().to_owned(),
+    };
+    let text = match ev.membership_change() {
+        C::Joined => format!("{target} joined"),
+        C::Left => format!("{target} left"),
+        C::Invited => format!("{sender_name} invited {target}"),
+        C::InvitationAccepted => format!("{target} accepted the invitation"),
+        C::InvitationRejected => format!("{target} declined the invitation"),
+        C::InvitationRevoked => format!("{sender_name} withdrew the invitation for {target}"),
+        C::Kicked => format!("{sender_name} removed {target}"),
+        C::Banned => format!("{sender_name} banned {target}"),
+        C::Unbanned => format!("{sender_name} unbanned {target}"),
+        C::KickedAndBanned => format!("{sender_name} removed and banned {target}"),
+        C::Knocked => format!("{target} asked to join"),
+        C::ProfileChanged { displayname_change, avatar_url_change } => {
+            match (displayname_change, avatar_url_change) {
+                (Some(c), _) => {
+                    let old = c.old.map(str::to_owned).unwrap_or_else(|| ev.state_key.localpart().to_owned());
+                    let new = c.new.map(str::to_owned).unwrap_or_else(|| ev.state_key.localpart().to_owned());
+                    format!("{old} is now known as {new}")
+                }
+                (None, Some(_)) => format!("{target} changed their avatar"),
+                _ => return None,
+            }
+        }
+        _ => return None,
+    };
+    Some(text)
+}
+
+fn role_of(power: i64) -> &'static str {
+    if power >= 100 { "admin" } else if power >= 50 { "moderator" } else { "member" }
+}
+
+fn power_i64(p: matrix_sdk::ruma::events::room::power_levels::UserPowerLevel) -> i64 {
+    match p {
+        matrix_sdk::ruma::events::room::power_levels::UserPowerLevel::Infinite => i64::MAX,
+        matrix_sdk::ruma::events::room::power_levels::UserPowerLevel::Int(i) => i.into(),
+        _ => 0,
+    }
+}
+
+impl Core {
+    pub(crate) async fn room_details(&self, room_id: &str) -> Result<RoomDetails> {
+        let room = self.room(room_id).await?;
+        let name = match room.display_name().await {
+            Ok(n) => n.to_string(),
+            Err(_) => room.room_id().to_string(),
+        };
+        let client = room.client();
+        let me = client.user_id().ok_or_else(|| anyhow!("no user id"))?;
+        let own = room.get_member_no_sync(me).await.ok().flatten();
+        let (can_invite, can_kick, can_ban, can_set_name, can_set_topic, can_redact_other) = match own {
+            Some(m) => (
+                m.can_invite(),
+                m.can_kick(),
+                m.can_ban(),
+                m.can_send_state(matrix_sdk::ruma::events::StateEventType::RoomName),
+                m.can_send_state(matrix_sdk::ruma::events::StateEventType::RoomTopic),
+                m.can_redact_other(),
+            ),
+            None => (false, false, false, false, false, false),
+        };
+        use matrix_sdk::ruma::room::JoinRuleKind as J;
+        let join_rule = match room.join_rule().map(|r| r.kind()) {
+            Some(J::Public) => "public",
+            Some(J::Invite) => "invite",
+            Some(J::Knock) => "knock",
+            Some(J::Restricted) | Some(J::KnockRestricted) => "restricted",
+            _ => "other",
+        }
+        .to_owned();
+        Ok(RoomDetails {
+            id: room.room_id().to_string(),
+            name,
+            topic: room.topic(),
+            avatar: room.avatar_url().map(|u| u.to_string()),
+            alias: room.canonical_alias().map(|a| a.to_string()),
+            encrypted: room.latest_encryption_state().await.map(|s| s.is_encrypted()).unwrap_or(false),
+            direct: room.is_direct().await.unwrap_or(false),
+            join_rule,
+            member_count: room.joined_members_count(),
+            can_invite,
+            can_kick,
+            can_ban,
+            can_set_name,
+            can_set_topic,
+            can_redact_other,
+        })
+    }
+
+    pub(crate) async fn members(&self, room_id: &str, query: &str, limit: u32) -> Result<Vec<MemberInfo>> {
+        let room = self.room(room_id).await?;
+        let members = room.members(matrix_sdk::RoomMemberships::JOIN).await.context("loading members")?;
+        let q = query.trim().to_lowercase();
+        let mut out: Vec<MemberInfo> = members
+            .iter()
+            .filter(|m| q.is_empty() || m.name().to_lowercase().contains(&q) || m.user_id().as_str().to_lowercase().contains(&q))
+            .map(|m| {
+                let power = power_i64(m.power_level());
+                MemberInfo {
+                    id: m.user_id().to_string(),
+                    name: m.name().to_owned(),
+                    avatar: m.avatar_url().map(|u| u.to_string()),
+                    power,
+                    role: role_of(power).to_owned(),
+                }
+            })
+            .collect();
+        out.sort_by(|a, b| b.power.cmp(&a.power).then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase())));
+        out.truncate(limit.clamp(1, 2000) as usize);
+        Ok(out)
+    }
+
+    /// Small square avatar into the media cache, keyed by the mxc URL.
+    pub(crate) async fn avatar(&self, url: &str) -> Result<String> {
+        let client = self.client().await?;
+        let mxc = matrix_sdk::ruma::OwnedMxcUri::from(url);
+        mxc.validate().map_err(|e| anyhow!("invalid avatar url: {e}"))?;
+        let dir = crate::media::avatar_cache_dir()?;
+        let path = dir.join(format!("{}.png", crate::media::hash_of(url)));
+        if path.exists() {
+            return Ok(path.to_string_lossy().into_owned());
+        }
+        let bytes = client
+            .media()
+            .get_media_content(
+                &matrix_sdk::media::MediaRequestParameters {
+                    source: matrix_sdk::ruma::events::room::MediaSource::Plain(mxc),
+                    format: matrix_sdk::media::MediaFormat::Thumbnail(matrix_sdk::media::MediaThumbnailSettings::new(
+                        UInt::from(96u32),
+                        UInt::from(96u32),
+                    )),
+                },
+                true,
+            )
+            .await
+            .context("fetching avatar")?;
+        std::fs::write(&path, &bytes).with_context(|| format!("writing {}", path.display()))?;
+        Ok(path.to_string_lossy().into_owned())
     }
 }
 

@@ -106,6 +106,9 @@ the response echoes.
 | `delete` | `room`, `event_id` | `{}` — redacts one of our messages |
 | `react` / `unreact` | `room`, `event_id`, `key` / `room`, `reaction_id` | `{reaction_id}` / `{}` |
 | `typing` | `room`, `typing` | `{}` |
+| `room_details` | `room` | `{id, name, topic?, avatar?, alias?, encrypted, direct, join_rule, member_count, can_invite, can_kick, can_ban, can_set_name, can_set_topic, can_redact_other}` |
+| `members` | `room`, `query?`, `limit` | `[{id, name, avatar?, power, role}]`, most powerful first |
+| `avatar` | `url` (mxc) | `{path}` — 96px square in `~/.cache/omarchy-yapper/avatars/` |
 | `mark_read` | `room`, `event_id` | `{}` — public read receipt and fully-read marker |
 | `search_rooms` | `query`, `server?`, `limit` | `[{id, name, alias?, topic?, members, joined}]` |
 | `join` | `room` (alias or id) | room info |
@@ -128,7 +131,9 @@ Responses: `{"id":…, "ok":true, "result":…}` or `{"id":…, "ok":false, "err
 A `message` is `{room, event_id, sender, sender_name, body, html?, msgtype, ts, encrypted, attachment?, reply_to?, edited, reactions, read_by, deleted}`
 — `reply_to` is `{event_id, sender, sender_name, body}`; an edited message carries its latest
 text; `reactions` is `[{key, count, senders: [{id, name, reaction_id}], mine?}]`; `read_by`
-lists others whose read receipt points here; a deleted message keeps its place with `deleted: true`
+lists others whose read receipt points here; a deleted message keeps its place with `deleted: true`.
+Rooms and senders carry `avatar` / `sender_avatar` mxc URLs. Membership changes come as
+`msgtype: "system"` messages whose body is the line to show ("X joined").
 — `attachment` is `{kind, name, caption?, mime?, size?, width?, height?, has_thumbnail}` for
 `m.image`, `m.file`, `m.video` and `m.audio`
 — `ts` in milliseconds since the epoch, `encrypted` true when the event
@@ -199,7 +204,7 @@ package builds `--frozen`.
 
 ## Roadmap
 
-1. Room info and management (Tier 2).
+1. Room management: invite, kick, name/topic, mute (Tier 2).
 3. **Keyring** — store passphrase in the Secret Service instead of `session.json`.
 
 ## License

@@ -99,6 +99,18 @@ fn cache_dir() -> Result<PathBuf> {
     Ok(dir)
 }
 
+pub fn avatar_cache_dir() -> Result<PathBuf> {
+    let dir = cache_dir()?.parent().unwrap_or(Path::new(".")).join("avatars");
+    std::fs::create_dir_all(&dir)?;
+    Ok(dir)
+}
+
+pub fn hash_of(s: &str) -> String {
+    let mut h = DefaultHasher::new();
+    s.hash(&mut h);
+    format!("{:016x}", h.finish())
+}
+
 fn cache_name(event_id: &str, thumbnail: bool, mime: Option<&str>, filename: &str) -> String {
     let mut h = DefaultHasher::new();
     event_id.hash(&mut h);
