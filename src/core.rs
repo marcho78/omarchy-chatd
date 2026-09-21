@@ -57,6 +57,7 @@ use url::Url;
 
 use crate::protocol::{
     Command, DirectoryRoom, DirectoryUser, Event, InviteInfo, Message, Request, Response, RoomInfo, Status,
+    TimelinePage,
 };
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -200,8 +201,8 @@ impl Core {
                 Ok(serde_json::to_value(self.status().await)?)
             }
             Command::Rooms => Ok(serde_json::to_value(self.rooms().await?)?),
-            Command::Timeline { room, limit } => {
-                Ok(serde_json::to_value(self.timeline(&room, limit).await?)?)
+            Command::Timeline { room, limit, before } => {
+                Ok(serde_json::to_value(self.timeline(&room, limit, before).await?)?)
             }
             Command::Send { room, body } => {
                 let event_id = self.send(&room, body).await?;
@@ -748,47 +749,69 @@ impl Core {
         Ok(out)
     }
 
-    async fn timeline(&self, room_id: &str, limit: u32) -> Result<Vec<Message>> {
+    async fn timeline(&self, room_id: &str, limit: u32, before: Option<String>) -> Result<TimelinePage> {
         let room = self.room(room_id).await?;
-        let mut opts = MessagesOptions::backward();
-        opts.limit = UInt::from(limit.clamp(1, 200));
-        let page = room.messages(opts).await.context("fetching messages")?;
-
+        let mut from = before.filter(|t| !t.is_empty());
         let mut out = Vec::new();
-        for ev in page.chunk {
-            let encrypted = ev.encryption_info().is_some();
-            let Ok(parsed) = ev.raw().deserialize() else { continue };
-            match parsed {
-                AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::RoomMessage(
-                    SyncMessageLikeEvent::Original(msg),
-                )) => out.push(to_message(&room, msg, encrypted).await),
-                // Still encrypted: we have no key (yet). Show a placeholder so
-                // the gap is visible; backup or key sharing may fill it later.
-                AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::RoomEncrypted(
-                    SyncMessageLikeEvent::Original(enc),
-                )) => {
-                    let sender_name = match room.get_member_no_sync(&enc.sender).await {
-                        Ok(Some(m)) => m.name().to_owned(),
-                        _ => enc.sender.localpart().to_owned(),
-                    };
-                    out.push(Message {
-                        room: room.room_id().to_string(),
-                        event_id: enc.event_id.to_string(),
-                        sender: enc.sender.to_string(),
-                        sender_name,
-                        body: "Unable to decrypt this message".to_owned(),
-                        html: None,
-                        msgtype: "unable_to_decrypt".to_owned(),
-                        ts: enc.origin_server_ts.0.into(),
-                        encrypted: true,
-                        attachment: None,
-                    });
+        let mut next: Option<String> = None;
+        // A chunk can be nothing but state events (room creation, joins);
+        // keep going so a page always carries messages or the real end.
+        for _ in 0..6 {
+            let mut opts = MessagesOptions::backward();
+            opts.limit = UInt::from(limit.clamp(1, 200));
+            opts.from = from.clone();
+            let page = room.messages(opts).await.context("fetching messages")?;
+            let raw_count = page.chunk.len();
+            for ev in page.chunk {
+                if let Some(m) = self.message_from_event(&room, ev).await {
+                    out.push(m);
                 }
-                _ => {}
             }
+            // The server omits `end` when there is nothing further back, and
+            // under-fills a chunk only at the start of history — matrix.org
+            // sends a cursor either way, so use the fill as the signal.
+            next = if raw_count < limit.clamp(1, 200) as usize { None } else { page.end.clone() };
+            if !out.is_empty() || next.is_none() {
+                break;
+            }
+            from = next.clone();
         }
         out.reverse(); // backward pagination yields newest first
-        Ok(out)
+        Ok(TimelinePage { messages: out, next })
+    }
+
+    /// A timeline event as a message, or None for anything that is not one.
+    async fn message_from_event(&self, room: &Room, ev: matrix_sdk::deserialized_responses::TimelineEvent) -> Option<Message> {
+        let encrypted = ev.encryption_info().is_some();
+        let parsed = ev.raw().deserialize().ok()?;
+        match parsed {
+            AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::RoomMessage(
+                SyncMessageLikeEvent::Original(msg),
+            )) => Some(to_message(room, msg, encrypted).await),
+            // Still encrypted: we have no key (yet). Show a placeholder so
+            // the gap is visible; backup or key sharing may fill it later.
+            AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::RoomEncrypted(
+                SyncMessageLikeEvent::Original(enc),
+            )) => {
+                let sender_name = match room.get_member_no_sync(&enc.sender).await {
+                    Ok(Some(m)) => m.name().to_owned(),
+                    _ => enc.sender.localpart().to_owned(),
+                };
+                Some(Message {
+                    room: room.room_id().to_string(),
+                    event_id: enc.event_id.to_string(),
+                    sender: enc.sender.to_string(),
+                    sender_name,
+                    body: "Unable to decrypt this message".to_owned(),
+                    html: None,
+                    msgtype: "unable_to_decrypt".to_owned(),
+                    ts: enc.origin_server_ts.0.into(),
+                    encrypted: true,
+                    attachment: None,
+                })
+            }
+            _ => None,
+        }
     }
 
     async fn send(&self, room_id: &str, body: String) -> Result<String> {

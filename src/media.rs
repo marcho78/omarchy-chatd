@@ -32,6 +32,15 @@ const MAX_UPLOAD: u64 = 100 * 1024 * 1024;
 
 /// What the client needs to know to render an attachment message.
 pub fn attachment_of(msgtype: &MessageType) -> Option<Attachment> {
+    let caption = match msgtype {
+        MessageType::Image(c) => c.caption(),
+        MessageType::File(c) => c.caption(),
+        MessageType::Video(c) => c.caption(),
+        MessageType::Audio(c) => c.caption(),
+        _ => None,
+    }
+    .map(str::to_owned)
+    .filter(|c| !c.trim().is_empty());
     let (kind, name, mime, size, width, height, thumb) = match msgtype {
         MessageType::Image(c) => {
             let i = c.info.as_deref();
@@ -77,7 +86,7 @@ pub fn attachment_of(msgtype: &MessageType) -> Option<Attachment> {
         }
         _ => return None,
     };
-    Some(Attachment { kind: kind.to_owned(), name, mime, size, width, height, has_thumbnail: thumb })
+    Some(Attachment { kind: kind.to_owned(), name, caption, mime, size, width, height, has_thumbnail: thumb })
 }
 
 fn cache_dir() -> Result<PathBuf> {

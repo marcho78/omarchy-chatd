@@ -38,11 +38,15 @@ pub enum Command {
     Logout,
     /// Joined rooms with names, encryption flag and unread counts.
     Rooms,
-    /// Most recent messages in a room, oldest first.
+    /// A page of messages in a room, oldest first. Without `before` it is
+    /// the most recent page; pass the previous page's `next` to go further
+    /// back. `next` is absent when history is exhausted.
     Timeline {
         room: String,
         #[serde(default = "default_limit")]
         limit: u32,
+        #[serde(default)]
+        before: Option<String>,
     },
     /// Send a plain-text message. Encrypted automatically in encrypted rooms.
     Send { room: String, body: String },
@@ -272,6 +276,14 @@ pub struct RoomInfo {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct TimelinePage {
+    pub messages: Vec<Message>,
+    /// Cursor for the page before this one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct Message {
     pub room: String,
     pub event_id: String,
@@ -297,6 +309,9 @@ pub struct Attachment {
     /// image | file | video | audio
     pub kind: String,
     pub name: String,
+    /// The sender's caption, when the body is more than the filename.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub caption: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mime: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

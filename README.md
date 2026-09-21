@@ -100,7 +100,7 @@ the response echoes.
 | `login` | `homeserver`, `username`, `password` | status |
 | `logout` | | status |
 | `rooms` | | `[{id, name, encrypted, direct, unread, highlights}]`, unread first |
-| `timeline` | `room`, `limit` (default 50, max 200) | `[message]`, oldest first |
+| `timeline` | `room`, `limit` (default 50, max 200), `before?` | `{messages, next?}` — oldest first; pass `next` as `before` for the page before; no `next` at the start of history |
 | `send` | `room`, `body` | `{event_id}` |
 | `mark_read` | `room`, `event_id` | `{}` |
 | `search_rooms` | `query`, `server?`, `limit` | `[{id, name, alias?, topic?, members, joined}]` |
@@ -122,7 +122,7 @@ the response echoes.
 Responses: `{"id":…, "ok":true, "result":…}` or `{"id":…, "ok":false, "error":"…"}`.
 
 A `message` is `{room, event_id, sender, sender_name, body, html?, msgtype, ts, encrypted, attachment?}`
-— `attachment` is `{kind, name, mime?, size?, width?, height?, has_thumbnail}` for
+— `attachment` is `{kind, name, caption?, mime?, size?, width?, height?, has_thumbnail}` for
 `m.image`, `m.file`, `m.video` and `m.audio`
 — `ts` in milliseconds since the epoch, `encrypted` true when the event
 arrived as `m.room.encrypted` and was decrypted locally, `html` the sender's
@@ -187,7 +187,7 @@ package builds `--frozen`.
 
 ## Roadmap
 
-1. Scrollback, read markers, replies, edits.
+1. Read markers, replies, edits.
 3. **Keyring** — store passphrase in the Secret Service instead of `session.json`.
 
 ## License
