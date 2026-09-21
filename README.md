@@ -125,6 +125,12 @@ scripts/smoke.py '{"cmd":"timeline","room":"!abc:matrix.org","limit":5}'
 socat - UNIX-CONNECT:$XDG_RUNTIME_DIR/omarchy-yapper.sock   # or interactively
 ```
 
+## Releases
+
+`scripts/release.sh X.Y.Z` bumps the version in `Cargo.toml`, `Cargo.lock` and the
+`PKGBUILD`, commits, tags `vX.Y.Z` and pushes. The Yapper plugin checks the
+newest `v*` tag against the running daemon's version and offers the update.
+
 ## Development
 
 ```bash
