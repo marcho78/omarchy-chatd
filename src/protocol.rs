@@ -48,10 +48,53 @@ pub enum Command {
     Send { room: String, body: String },
     /// Send a read receipt up to the given event.
     MarkRead { room: String, event_id: String },
+    /// Search a server's public room directory (our own homeserver unless
+    /// `server` names another).
+    SearchRooms {
+        query: String,
+        #[serde(default)]
+        server: Option<String>,
+        #[serde(default = "default_search_limit")]
+        limit: u32,
+    },
+    /// Join a room by `#alias:server` or `!id:server`.
+    Join { room: String },
+    /// Search the user directory.
+    SearchUsers {
+        query: String,
+        #[serde(default = "default_search_limit")]
+        limit: u32,
+    },
+    /// Open a direct chat with a user: the existing DM if there is one,
+    /// otherwise a new encrypted one.
+    Dm { user: String },
+    /// Create a room. Encrypted and private unless told otherwise.
+    CreateRoom {
+        name: String,
+        #[serde(default)]
+        topic: Option<String>,
+        #[serde(default = "default_true")]
+        encrypted: bool,
+        #[serde(default = "default_true")]
+        private: bool,
+    },
+    /// Pending invitations.
+    Invites,
+    AcceptInvite { room: String },
+    DeclineInvite { room: String },
+    Leave { room: String },
 }
 
 fn default_limit() -> u32 {
     50
+}
+
+fn default_search_limit() -> u32 {
+    20
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Serialize)]
@@ -80,6 +123,41 @@ pub enum Event {
     State(Status),
     /// A message arrived in a joined room.
     Message(Message),
+    /// We were invited to a room.
+    Invite(InviteInfo),
+    /// Our own membership changed somewhere (joined, left, kicked): the
+    /// room list should be fetched again.
+    RoomsChanged,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct InviteInfo {
+    pub room: String,
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inviter: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inviter_name: Option<String>,
+    pub direct: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DirectoryRoom {
+    pub id: String,
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub alias: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub topic: Option<String>,
+    pub members: u64,
+    pub joined: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DirectoryUser {
+    pub id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -101,6 +179,8 @@ pub struct Status {
 pub struct RoomInfo {
     pub id: String,
     pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub topic: Option<String>,
     pub encrypted: bool,
     pub direct: bool,
     pub unread: u64,

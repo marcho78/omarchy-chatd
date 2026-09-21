@@ -27,12 +27,22 @@ use matrix_sdk::{
     event_handler::Ctx,
     room::MessagesOptions,
     ruma::{
-        OwnedRoomId, RoomId, UInt,
-        api::client::{filter::FilterDefinition, receipt::create_receipt::v3::ReceiptType},
+        OwnedRoomId, OwnedServerName, RoomId, RoomOrAliasId, UInt, UserId,
+        api::client::{
+            directory::get_public_rooms_filtered,
+            filter::FilterDefinition,
+            receipt::create_receipt::v3::ReceiptType,
+            room::{Visibility, create_room},
+        },
+        directory::Filter,
         events::{
-            AnySyncMessageLikeEvent, AnySyncTimelineEvent, SyncMessageLikeEvent,
+            AnySyncMessageLikeEvent, AnySyncTimelineEvent, EmptyStateKey, InitialStateEvent, SyncMessageLikeEvent,
             receipt::ReceiptThread,
-            room::message::{OriginalSyncRoomMessageEvent, RoomMessageEventContent},
+            room::{
+                encryption::RoomEncryptionEventContent,
+                member::{MembershipState, OriginalSyncRoomMemberEvent, StrippedRoomMemberEvent},
+                message::{OriginalSyncRoomMessageEvent, RoomMessageEventContent},
+            },
         },
         serde::Raw,
     },
@@ -45,13 +55,17 @@ use tokio::{sync::broadcast, task::JoinHandle};
 use tracing::{info, warn};
 use url::Url;
 
-use crate::protocol::{Command, Event, Message, Request, Response, RoomInfo, Status};
+use crate::protocol::{
+    Command, DirectoryRoom, DirectoryUser, Event, InviteInfo, Message, Request, Response, RoomInfo, Status,
+};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 const DEVICE_NAME: &str = "Omarchy Chat";
 const CLIENT_URI: &str = "https://github.com/marcho78/omarchy-chat";
 /// How long a browser sign-in may sit waiting for the redirect.
 const OAUTH_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+/// Directory searches, especially on a remote server, can stall on federation.
+const SEARCH_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// What survives a restart. Written to `<data_dir>/session.json` with mode
 /// 0600. The store passphrase is random and only ever lives here; the user's
@@ -193,6 +207,35 @@ impl Core {
             }
             Command::MarkRead { room, event_id } => {
                 self.mark_read(&room, &event_id).await?;
+                Ok(json!({}))
+            }
+            Command::SearchRooms { query, server, limit } => {
+                Ok(serde_json::to_value(self.search_rooms(&query, server.as_deref(), limit).await?)?)
+            }
+            Command::Join { room } => {
+                let room = self.join(&room).await?;
+                Ok(serde_json::to_value(self.room_info(&room).await)?)
+            }
+            Command::SearchUsers { query, limit } => {
+                Ok(serde_json::to_value(self.search_users(&query, limit).await?)?)
+            }
+            Command::Dm { user } => {
+                let room = self.dm(&user).await?;
+                Ok(serde_json::to_value(self.room_info(&room).await)?)
+            }
+            Command::CreateRoom { name, topic, encrypted, private } => {
+                let room = self.create_room(name, topic, encrypted, private).await?;
+                Ok(serde_json::to_value(self.room_info(&room).await)?)
+            }
+            Command::Invites => Ok(serde_json::to_value(self.invites().await?)?),
+            Command::AcceptInvite { room } => {
+                let room = self.room(&room).await?;
+                room.join().await.context("accepting invite")?;
+                Ok(serde_json::to_value(self.room_info(&room).await)?)
+            }
+            Command::DeclineInvite { room } | Command::Leave { room } => {
+                let room = self.room(&room).await?;
+                room.leave().await.context("leaving room")?;
                 Ok(json!({}))
             }
         }
@@ -426,6 +469,8 @@ impl Core {
     async fn start(self: &Arc<Self>, client: Client, sync_token: Option<String>) {
         client.add_event_handler_context(HandlerCtx { events: self.events.clone() });
         client.add_event_handler(on_room_message);
+        client.add_event_handler(on_stripped_member);
+        client.add_event_handler(on_member);
 
         let core = self.clone();
         let sync_client = client.clone();
@@ -552,26 +597,123 @@ impl Core {
         let client = self.client().await?;
         let mut out = Vec::new();
         for room in client.joined_rooms() {
-            let name = match room.display_name().await {
-                Ok(n) => n.to_string(),
-                Err(_) => room.room_id().to_string(),
-            };
-            let encrypted = room
-                .latest_encryption_state()
-                .await
-                .map(|s| s.is_encrypted())
-                .unwrap_or(false);
-            let counts = room.unread_notification_counts();
-            out.push(RoomInfo {
-                id: room.room_id().to_string(),
-                name,
-                encrypted,
-                direct: room.is_direct().await.unwrap_or(false),
-                unread: counts.notification_count,
-                highlights: counts.highlight_count,
-            });
+            out.push(self.room_info(&room).await);
         }
         out.sort_by(|a, b| b.unread.cmp(&a.unread).then_with(|| a.name.cmp(&b.name)));
+        Ok(out)
+    }
+
+    async fn room_info(&self, room: &Room) -> RoomInfo {
+        let name = match room.display_name().await {
+            Ok(n) => n.to_string(),
+            Err(_) => room.room_id().to_string(),
+        };
+        let encrypted = room
+            .latest_encryption_state()
+            .await
+            .map(|s| s.is_encrypted())
+            .unwrap_or(false);
+        let counts = room.unread_notification_counts();
+        RoomInfo {
+            id: room.room_id().to_string(),
+            name,
+            topic: room.topic(),
+            encrypted,
+            direct: room.is_direct().await.unwrap_or(false),
+            unread: counts.notification_count,
+            highlights: counts.highlight_count,
+        }
+    }
+
+    // ---------- discovery ----------
+
+    async fn search_rooms(&self, query: &str, server: Option<&str>, limit: u32) -> Result<Vec<DirectoryRoom>> {
+        let client = self.client().await?;
+        let mut req = get_public_rooms_filtered::v3::Request::new();
+        req.limit = Some(UInt::from(limit.clamp(1, 100)));
+        let mut filter = Filter::new();
+        filter.generic_search_term = Some(query.trim().to_owned());
+        req.filter = filter;
+        if let Some(server) = server.map(str::trim).filter(|s| !s.is_empty()) {
+            req.server = Some(OwnedServerName::try_from(server).context("invalid server name")?);
+        }
+        let resp = tokio::time::timeout(SEARCH_TIMEOUT, client.public_rooms_filtered(req))
+            .await
+            .map_err(|_| anyhow!("the room directory did not answer in time"))?
+            .context("searching the room directory")?;
+        Ok(resp
+            .chunk
+            .into_iter()
+            .map(|r| DirectoryRoom {
+                joined: client.get_room(&r.room_id).is_some_and(|room| room.state() == RoomState::Joined),
+                id: r.room_id.to_string(),
+                name: r
+                    .name
+                    .clone()
+                    .or_else(|| r.canonical_alias.as_ref().map(|a| a.to_string()))
+                    .unwrap_or_else(|| r.room_id.to_string()),
+                alias: r.canonical_alias.map(|a| a.to_string()),
+                topic: r.topic,
+                members: r.num_joined_members.into(),
+            })
+            .collect())
+    }
+
+    async fn join(&self, id_or_alias: &str) -> Result<Room> {
+        let client = self.client().await?;
+        let target = RoomOrAliasId::parse(id_or_alias.trim()).context("expected #alias:server or !id:server")?;
+        let via: Vec<OwnedServerName> = target.server_name().map(|s| vec![s.to_owned()]).unwrap_or_default();
+        client.join_room_by_id_or_alias(&target, &via).await.context("joining room")
+    }
+
+    async fn search_users(&self, query: &str, limit: u32) -> Result<Vec<DirectoryUser>> {
+        let client = self.client().await?;
+        let resp = tokio::time::timeout(SEARCH_TIMEOUT, client.search_users(query.trim(), u64::from(limit.clamp(1, 50))))
+            .await
+            .map_err(|_| anyhow!("the user directory did not answer in time"))?
+            .context("searching users")?;
+        Ok(resp
+            .results
+            .into_iter()
+            .map(|u| DirectoryUser { id: u.user_id.to_string(), name: u.display_name })
+            .collect())
+    }
+
+    async fn dm(&self, user: &str) -> Result<Room> {
+        let client = self.client().await?;
+        let user_id = UserId::parse(user.trim()).context("expected @user:server")?;
+        if let Some(room) = client.get_dm_room(&user_id) {
+            if room.state() == RoomState::Joined {
+                return Ok(room);
+            }
+        }
+        client.create_dm(&user_id).await.context("creating direct chat")
+    }
+
+    async fn create_room(&self, name: String, topic: Option<String>, encrypted: bool, private: bool) -> Result<Room> {
+        let client = self.client().await?;
+        let name = name.trim().to_owned();
+        if name.is_empty() {
+            bail!("a room needs a name");
+        }
+        let mut req = create_room::v3::Request::new();
+        req.name = Some(name);
+        req.topic = topic.map(|t| t.trim().to_owned()).filter(|t| !t.is_empty());
+        req.preset = Some(if private { create_room::v3::RoomPreset::PrivateChat } else { create_room::v3::RoomPreset::PublicChat });
+        req.visibility = if private { Visibility::Private } else { Visibility::Public };
+        if encrypted {
+            let content = RoomEncryptionEventContent::with_recommended_defaults();
+            req.initial_state = vec![InitialStateEvent::new(EmptyStateKey, content).to_raw_any()];
+        }
+        client.create_room(req).await.context("creating room")
+    }
+
+    async fn invites(&self) -> Result<Vec<InviteInfo>> {
+        let client = self.client().await?;
+        let mut out = Vec::new();
+        for room in client.invited_rooms() {
+            out.push(invite_info(&room).await);
+        }
         Ok(out)
     }
 
@@ -646,6 +788,46 @@ async fn on_room_message(
     }
     let msg = to_message(&room, event, encryption.is_some()).await;
     let _ = ctx.events.send(Event::Message(msg));
+}
+
+/// Invites arrive as stripped state; announce the ones addressed to us.
+async fn on_stripped_member(event: StrippedRoomMemberEvent, room: Room, client: Client, ctx: Ctx<HandlerCtx>) {
+    if event.content.membership != MembershipState::Invite {
+        return;
+    }
+    if client.user_id().is_none_or(|me| me != event.state_key) {
+        return;
+    }
+    if room.state() != RoomState::Invited {
+        return;
+    }
+    let _ = ctx.events.send(Event::Invite(invite_info(&room).await));
+}
+
+/// Our own membership changed in a room we are in: joined, left, kicked.
+async fn on_member(event: OriginalSyncRoomMemberEvent, client: Client, ctx: Ctx<HandlerCtx>) {
+    if client.user_id().is_none_or(|me| me != event.state_key) {
+        return;
+    }
+    let _ = ctx.events.send(Event::RoomsChanged);
+}
+
+async fn invite_info(room: &Room) -> InviteInfo {
+    let name = match room.display_name().await {
+        Ok(n) => n.to_string(),
+        Err(_) => room.room_id().to_string(),
+    };
+    let inviter = match room.invite_details().await {
+        Ok(details) => details.inviter,
+        Err(_) => None,
+    };
+    InviteInfo {
+        room: room.room_id().to_string(),
+        name,
+        inviter: inviter.as_ref().map(|m| m.user_id().to_string()),
+        inviter_name: inviter.as_ref().map(|m| m.name().to_owned()),
+        direct: room.is_direct().await.unwrap_or(false),
+    }
 }
 
 async fn to_message(room: &Room, ev: OriginalSyncRoomMessageEvent, encrypted: bool) -> Message {
