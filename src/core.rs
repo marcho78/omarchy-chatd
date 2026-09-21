@@ -66,7 +66,7 @@ use url::Url;
 use crate::protocol::{
     Command, DirectoryRoom, DirectoryUser, Event, InviteInfo, MemberInfo, Message, MessageEdit, Reaction,
     ReactionEvent, ReactionSender, ReceiptInfo, Redaction, ReplyPreview, Request, Response, RoomDetails, RoomInfo,
-    SpaceInfo, Status, TimelinePage, TypingInfo, UserRef,
+    SearchHit, SearchResults, SpaceInfo, Status, TimelinePage, TypingInfo, UserRef,
 };
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -76,6 +76,8 @@ const CLIENT_URI: &str = "https://github.com/marcho78/omarchy-yapper";
 const OAUTH_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 /// Directory searches, especially on a remote server, can stall on federation.
 const SEARCH_TIMEOUT: Duration = Duration::from_secs(20);
+/// Full-text search on a big homeserver can take a while on first use.
+const MESSAGE_SEARCH_TIMEOUT: Duration = Duration::from_secs(45);
 
 /// What survives a restart. Written to `<data_dir>/session.json` with mode
 /// 0600. The store passphrase is random and only ever lives here; the user's
@@ -306,6 +308,7 @@ impl Core {
                 Ok(json!({}))
             }
             Command::Spaces => Ok(serde_json::to_value(self.spaces().await?)?),
+            Command::Search { query, room, limit } => Ok(serde_json::to_value(self.search(&query, room.as_deref(), limit).await?)?),
             Command::MarkRead { room, event_id } => {
                 self.mark_read(&room, &event_id).await?;
                 Ok(json!({}))
@@ -1620,6 +1623,132 @@ impl Core {
         }
         let _ = self.events().send(Event::RoomsChanged);
         Ok(())
+    }
+
+    /// Server-side search covers unencrypted rooms. Encrypted rooms are
+    /// scanned locally through their decrypted history, a bounded number of
+    /// pages back, so a search there means "the recent past", not all time.
+    pub(crate) async fn search(&self, query: &str, room_id: Option<&str>, limit: u32) -> Result<SearchResults> {
+        use matrix_sdk::ruma::api::client::search::search_events::v3::{Categories, Criteria, Request};
+        let client = self.client().await?;
+        let q = query.trim();
+        if q.is_empty() {
+            bail!("nothing to search for");
+        }
+        let limit = limit.clamp(1, 200) as usize;
+        let rooms: Vec<Room> = match room_id {
+            Some(id) => vec![self.room(id).await?],
+            None => client.joined_rooms().into_iter().filter(|r| !r.is_space()).collect(),
+        };
+        let mut plain: Vec<matrix_sdk::ruma::OwnedRoomId> = Vec::new();
+        let mut encrypted: Vec<Room> = Vec::new();
+        for r in rooms {
+            if r.latest_encryption_state().await.map(|s| s.is_encrypted()).unwrap_or(false) {
+                encrypted.push(r);
+            } else {
+                plain.push(r.room_id().to_owned());
+            }
+        }
+        let mut hits: Vec<SearchHit> = Vec::new();
+
+        // Server search for the unencrypted set.
+        let server_rooms = plain.len() as u32;
+        if !plain.is_empty() {
+            let mut criteria = Criteria::new(q.to_owned());
+            criteria.filter.rooms = Some(plain);
+            criteria.filter.limit = Some(UInt::from(limit as u32));
+            let mut cats = Categories::new();
+            cats.room_events = Some(criteria);
+            match tokio::time::timeout(MESSAGE_SEARCH_TIMEOUT, client.send(Request::new(cats))).await {
+                Ok(Ok(resp)) => {
+                    for r in resp.search_categories.room_events.results {
+                        let Some(raw) = r.result else { continue };
+                        let Ok(ev) = raw.deserialize() else { continue };
+                        if let matrix_sdk::ruma::events::AnyTimelineEvent::MessageLike(
+                            matrix_sdk::ruma::events::AnyMessageLikeEvent::RoomMessage(
+                                matrix_sdk::ruma::events::MessageLikeEvent::Original(m),
+                            ),
+                        ) = ev
+                        {
+                            // An edit is a revision of another hit, not a message of its own.
+                            if matches!(m.content.relates_to, Some(Relation::Replacement(_))) {
+                                continue;
+                            }
+                            let room = client.get_room(&m.room_id);
+                            let (room_name, sender_name) = match &room {
+                                Some(room) => (
+                                    room.display_name().await.map(|n| n.to_string()).unwrap_or_else(|_| m.room_id.to_string()),
+                                    room.get_member_no_sync(&m.sender).await.ok().flatten().map(|mm| mm.name().to_owned()).unwrap_or_else(|| m.sender.localpart().to_owned()),
+                                ),
+                                None => (m.room_id.to_string(), m.sender.localpart().to_owned()),
+                            };
+                            hits.push(SearchHit {
+                                room: m.room_id.to_string(),
+                                room_name,
+                                event_id: m.event_id.to_string(),
+                                sender: m.sender.to_string(),
+                                sender_name,
+                                body: m.content.body().to_owned(),
+                                ts: m.origin_server_ts.0.into(),
+                            });
+                        }
+                    }
+                }
+                Ok(Err(e)) => warn!("server search: {e:#}"),
+                Err(_) => warn!("server search timed out"),
+            }
+        }
+
+        // Local scan for encrypted rooms: recent pages, decrypted by the SDK.
+        let needle = q.to_lowercase();
+        let mut scanned_messages = 0u32;
+        let pages_per_room = if room_id.is_some() { 12 } else { 3 };
+        for room in &encrypted {
+            let room_name = room.display_name().await.map(|n| n.to_string()).unwrap_or_else(|_| room.room_id().to_string());
+            let mut from: Option<String> = None;
+            for _ in 0..pages_per_room {
+                let mut opts = MessagesOptions::backward();
+                opts.limit = UInt::from(100u32);
+                opts.from = from.clone();
+                let Ok(page) = room.messages(opts).await else { break };
+                let raw_count = page.chunk.len();
+                for ev in page.chunk {
+                    if let Ok(AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::RoomMessage(SyncMessageLikeEvent::Original(m)))) = ev.raw().deserialize() {
+                        if matches!(m.content.relates_to, Some(Relation::Replacement(_))) {
+                            continue;
+                        }
+                        scanned_messages += 1;
+                        // Search the text as it reads now, after any edit.
+                        let edited = bundled_edit(ev.raw()).map(|(b, _)| b);
+                        let body = edited.as_deref().unwrap_or_else(|| m.content.body());
+                        if body.to_lowercase().contains(&needle) {
+                            let sender_name = room.get_member_no_sync(&m.sender).await.ok().flatten().map(|mm| mm.name().to_owned()).unwrap_or_else(|| m.sender.localpart().to_owned());
+                            hits.push(SearchHit {
+                                room: room.room_id().to_string(),
+                                room_name: room_name.clone(),
+                                event_id: m.event_id.to_string(),
+                                sender: m.sender.to_string(),
+                                sender_name,
+                                body: body.to_owned(),
+                                ts: m.origin_server_ts.0.into(),
+                            });
+                        }
+                    }
+                }
+                if raw_count < 100 {
+                    break;
+                }
+                from = page.end;
+                if from.is_none() {
+                    break;
+                }
+            }
+        }
+
+        hits.sort_by(|a, b| b.ts.cmp(&a.ts));
+        hits.dedup_by(|a, b| a.event_id == b.event_id);
+        hits.truncate(limit);
+        Ok(SearchResults { hits, scanned_rooms: encrypted.len() as u32, scanned_messages, server_rooms })
     }
 
     pub(crate) async fn spaces(&self) -> Result<Vec<SpaceInfo>> {

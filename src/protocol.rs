@@ -95,6 +95,15 @@ pub enum Command {
     SetFavourite { room: String, favourite: bool },
     /// Joined spaces with the rooms they contain.
     Spaces,
+    /// Search messages: the server for unencrypted rooms, a bounded local
+    /// scan for encrypted ones. `room` limits to one room.
+    Search {
+        query: String,
+        #[serde(default)]
+        room: Option<String>,
+        #[serde(default = "default_search_results")]
+        limit: u32,
+    },
     /// Mark the room read up to the given event: public read receipt plus
     /// the fully-read marker, so every client and device agrees.
     MarkRead { room: String, event_id: String },
@@ -183,6 +192,10 @@ fn default_true() -> bool {
 
 fn default_members_limit() -> u32 {
     200
+}
+
+fn default_search_results() -> u32 {
+    50
 }
 
 #[derive(Debug, Serialize)]
@@ -457,6 +470,26 @@ pub struct ReceiptInfo {
     /// Users whose read receipt moved, and the event it now points at.
     pub event_id: String,
     pub users: Vec<UserRef>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SearchHit {
+    pub room: String,
+    pub room_name: String,
+    pub event_id: String,
+    pub sender: String,
+    pub sender_name: String,
+    pub body: String,
+    pub ts: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SearchResults {
+    pub hits: Vec<SearchHit>,
+    /// Encrypted rooms searched locally, and how far back that went.
+    pub scanned_rooms: u32,
+    pub scanned_messages: u32,
+    pub server_rooms: u32,
 }
 
 #[derive(Debug, Clone, Serialize)]
