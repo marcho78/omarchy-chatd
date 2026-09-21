@@ -8,7 +8,7 @@
 mod core;
 mod protocol;
 
-use std::{os::unix::fs::PermissionsExt, path::PathBuf, sync::Arc};
+use std::{io::IsTerminal, os::unix::fs::PermissionsExt, path::PathBuf, sync::Arc};
 
 use anyhow::{Context, Result, bail};
 use clap::Parser;
@@ -49,6 +49,7 @@ fn default_data_dir() -> Result<PathBuf> {
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
+        .with_ansi(std::io::stderr().is_terminal())
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| "info,matrix_sdk=warn".into()),

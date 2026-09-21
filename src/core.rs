@@ -181,9 +181,13 @@ impl Core {
         if self.state.lock().await.client.is_some() {
             bail!("already logged in; log out first");
         }
-        let mut r = rng();
-        let store_name: String = (&mut r).sample_iter(Alphanumeric).take(8).map(char::from).collect();
-        let store_passphrase: String = (&mut r).sample_iter(Alphanumeric).take(32).map(char::from).collect();
+        // ThreadRng is !Send, so it must not live across an await.
+        let (store_name, store_passphrase) = {
+            let mut r = rng();
+            let name: String = (&mut r).sample_iter(Alphanumeric).take(8).map(char::from).collect();
+            let pass: String = (&mut r).sample_iter(Alphanumeric).take(32).map(char::from).collect();
+            (name, pass)
+        };
         let store_path = self.data_dir.join(format!("store-{store_name}"));
 
         let client = Client::builder()
@@ -389,7 +393,7 @@ impl Core {
     async fn send(&self, room_id: &str, body: String) -> Result<String> {
         let room = self.room(room_id).await?;
         let resp = room.send(RoomMessageEventContent::text_plain(body)).await.context("sending")?;
-        Ok(resp.event_id.to_string())
+        Ok(resp.response.event_id.to_string())
     }
 
     async fn mark_read(&self, room_id: &str, event_id: &str) -> Result<()> {
