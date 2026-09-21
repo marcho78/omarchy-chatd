@@ -1,0 +1,30 @@
+[package]
+name = "omarchy-chatd"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.96"
+license = "MIT"
+description = "End-to-end encrypted Matrix daemon behind the Omarchy chat plugin"
+repository = "https://github.com/marcho78/omarchy-chatd"
+
+[[bin]]
+name = "omarchy-chatd"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+libc = "0.2"
+# Default features: e2e-encryption, automatic-room-key-forwarding, sqlite, rustls.
+matrix-sdk = "0.19"
+rand = "0.10"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "io-util", "sync", "signal", "fs"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
