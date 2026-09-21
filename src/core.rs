@@ -66,7 +66,7 @@ use url::Url;
 use crate::protocol::{
     Command, DirectoryRoom, DirectoryUser, Event, InviteInfo, MemberInfo, Message, MessageEdit, Reaction,
     ReactionEvent, ReactionSender, ReceiptInfo, Redaction, ReplyPreview, Request, Response, RoomDetails, RoomInfo,
-    Status, TimelinePage, TypingInfo, UserRef,
+    SpaceInfo, Status, TimelinePage, TypingInfo, UserRef,
 };
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -135,11 +135,15 @@ pub struct Core {
     /// them per room until the target's page is loaded.
     /// room -> target event -> (key, sender, reaction event id)
     pending_reactions: tokio::sync::Mutex<std::collections::HashMap<String, std::collections::HashMap<String, Vec<(String, matrix_sdk::ruma::OwnedUserId, String)>>>>,
+    /// room -> timestamp of its latest message: seeded from the server the
+    /// first time a room is listed, then kept current by incoming events.
+    activity: Arc<tokio::sync::Mutex<std::collections::HashMap<String, u64>>>,
 }
 
 #[derive(Clone)]
 struct HandlerCtx {
     events: broadcast::Sender<Event>,
+    activity: Arc<tokio::sync::Mutex<std::collections::HashMap<String, u64>>>,
 }
 
 impl Core {
@@ -149,7 +153,7 @@ impl Core {
             .mode(0o700)
             .create(&data_dir)
             .with_context(|| format!("creating {}", data_dir.display()))?;
-        Ok(Arc::new(Self { data_dir, events, state: Default::default(), flows: Default::default(), pending_reactions: Default::default() }))
+        Ok(Arc::new(Self { data_dir, events, state: Default::default(), flows: Default::default(), pending_reactions: Default::default(), activity: Default::default() }))
     }
 
     pub fn events(&self) -> &broadcast::Sender<Event> {
@@ -295,6 +299,13 @@ impl Core {
                 self.set_notification_mode(&room, &mode).await?;
                 Ok(serde_json::to_value(self.room_details(&room).await?)?)
             }
+            Command::SetFavourite { room, favourite } => {
+                let r = self.room(&room).await?;
+                r.set_is_favourite(favourite, None).await.context("updating favourite")?;
+                let _ = self.events().send(Event::RoomsChanged);
+                Ok(json!({}))
+            }
+            Command::Spaces => Ok(serde_json::to_value(self.spaces().await?)?),
             Command::MarkRead { room, event_id } => {
                 self.mark_read(&room, &event_id).await?;
                 Ok(json!({}))
@@ -590,7 +601,7 @@ impl Core {
         if let Err(e) = client.event_cache().subscribe() {
             warn!("event cache: {e:#}");
         }
-        client.add_event_handler_context(HandlerCtx { events: self.events.clone() });
+        client.add_event_handler_context(HandlerCtx { events: self.events.clone(), activity: self.activity.clone() });
         client.add_event_handler(on_room_message);
         client.add_event_handler(on_stripped_member);
         client.add_event_handler(on_member);
@@ -754,6 +765,10 @@ impl Core {
         let client = self.client().await?;
         let mut out = Vec::new();
         for room in client.joined_rooms() {
+            // Spaces are folders, not chats; they come from `spaces`.
+            if room.is_space() {
+                continue;
+            }
             out.push(self.room_info(&room).await);
         }
         out.sort_by(|a, b| b.unread.cmp(&a.unread).then_with(|| a.name.cmp(&b.name)));
@@ -787,20 +802,25 @@ impl Core {
         // through sync; a receipt placed on paged history leaves it at 0. So
         // also count what the cache holds from others after we last read.
         let mut unread = room.num_unread_messages();
-        if let (Some(me), Some(at)) = (me.as_deref(), read_at) {
-            if let Ok((cache, _guard)) = room.event_cache().await {
-                if let Ok(events) = cache.events().await {
-                    let mut n = 0u64;
-                    for ev in events {
-                        if let Ok(AnySyncTimelineEvent::MessageLike(m)) = ev.raw().deserialize() {
-                            let is_msg = matches!(m, AnySyncMessageLikeEvent::RoomMessage(_) | AnySyncMessageLikeEvent::RoomEncrypted(_));
-                            if is_msg && m.sender() != me && u64::from(m.origin_server_ts().0) > at {
-                                n += 1;
+        let mut last_activity: Option<u64> = None;
+        if let Ok((cache, _guard)) = room.event_cache().await {
+            if let Ok(events) = cache.events().await {
+                let mut n = 0u64;
+                for ev in events {
+                    if let Ok(AnySyncTimelineEvent::MessageLike(m)) = ev.raw().deserialize() {
+                        let ts = u64::from(m.origin_server_ts().0);
+                        let is_msg = matches!(m, AnySyncMessageLikeEvent::RoomMessage(_) | AnySyncMessageLikeEvent::RoomEncrypted(_));
+                        if is_msg {
+                            last_activity = Some(last_activity.map_or(ts, |t| t.max(ts)));
+                            if let (Some(me), Some(at)) = (me.as_deref(), read_at) {
+                                if m.sender() != me && ts > at {
+                                    n += 1;
+                                }
                             }
                         }
                     }
-                    unread = unread.max(n);
                 }
+                unread = unread.max(n);
             }
         }
         let direct = room.is_direct().await.unwrap_or(false);
@@ -813,6 +833,9 @@ impl Core {
             direct,
             avatar: room.avatar_url().map(|u| u.to_string()),
             notification_mode,
+            favourite: room.is_favourite(),
+            low_priority: room.is_low_priority(),
+            last_activity: room.recency_stamp().map(u64::from).or(self.activity_of(&room, last_activity).await),
             unread,
             highlights: room.num_unread_mentions().max(counts.highlight_count),
             notifications: counts.notification_count,
@@ -1160,6 +1183,11 @@ async fn on_room_message(
     let mut msg = to_message(&room, event, encryption.is_some()).await;
     msg.notify = notify;
     msg.highlight = highlight;
+    {
+        let mut a = ctx.activity.lock().await;
+        let e = a.entry(room.room_id().to_string()).or_insert(0);
+        *e = (*e).max(msg.ts);
+    }
     let _ = ctx.events.send(Event::Message(msg));
 }
 
@@ -1522,6 +1550,35 @@ impl Core {
         })
     }
 
+    /// Latest message time for the room list's ordering. The event cache is
+    /// empty at startup, so the first look at a room asks the server for
+    /// its last message; incoming events keep the value fresh after that.
+    async fn activity_of(&self, room: &Room, from_cache: Option<u64>) -> Option<u64> {
+        let key = room.room_id().to_string();
+        let known = self.activity.lock().await.get(&key).copied();
+        let mut best = match (known, from_cache) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (a, b) => a.or(b),
+        };
+        if known.is_none() {
+            let mut opts = MessagesOptions::backward();
+            opts.limit = UInt::from(20u32);
+            if let Ok(page) = room.messages(opts).await {
+                for ev in page.chunk {
+                    if let Ok(AnySyncTimelineEvent::MessageLike(m)) = ev.raw().deserialize() {
+                        if matches!(m, AnySyncMessageLikeEvent::RoomMessage(_) | AnySyncMessageLikeEvent::RoomEncrypted(_)) {
+                            let ts = u64::from(m.origin_server_ts().0);
+                            best = Some(best.map_or(ts, |b| b.max(ts)));
+                            break;
+                        }
+                    }
+                }
+            }
+            self.activity.lock().await.insert(key, best.unwrap_or(0));
+        }
+        best.filter(|&t| t > 0)
+    }
+
     /// The room's effective notification mode and whether it is room-specific.
     async fn settings(&self) -> Result<matrix_sdk::notification_settings::NotificationSettings> {
         self.state.lock().await.notification_settings.clone().ok_or_else(|| anyhow!("not logged in"))
@@ -1563,6 +1620,38 @@ impl Core {
         }
         let _ = self.events().send(Event::RoomsChanged);
         Ok(())
+    }
+
+    pub(crate) async fn spaces(&self) -> Result<Vec<SpaceInfo>> {
+        use matrix_sdk::ruma::events::space::child::SpaceChildEventContent;
+        let client = self.client().await?;
+        let mut out = Vec::new();
+        for room in client.joined_rooms() {
+            if !room.is_space() {
+                continue;
+            }
+            let name = match room.display_name().await {
+                Ok(n) => n.to_string(),
+                Err(_) => room.room_id().to_string(),
+            };
+            let mut children = Vec::new();
+            if let Ok(events) = room.get_state_events_static::<SpaceChildEventContent>().await {
+                for ev in events {
+                    use matrix_sdk::deserialized_responses::SyncOrStrippedState;
+                    // A child with an empty `via` has been removed from the space.
+                    if let Ok(SyncOrStrippedState::Sync(sync)) = ev.deserialize() {
+                        if let Some(o) = sync.as_original() {
+                            if !o.content.via.is_empty() {
+                                children.push(o.state_key.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+            out.push(SpaceInfo { id: room.room_id().to_string(), name, avatar: room.avatar_url().map(|u| u.to_string()), children });
+        }
+        out.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+        Ok(out)
     }
 
     pub(crate) async fn members(&self, room_id: &str, query: &str, limit: u32) -> Result<Vec<MemberInfo>> {

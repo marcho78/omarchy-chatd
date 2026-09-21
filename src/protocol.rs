@@ -91,6 +91,10 @@ pub enum Command {
     SetTopic { room: String, topic: String },
     /// Per-room notification mode: all | mentions | mute | default.
     SetNotificationMode { room: String, mode: String },
+    /// Star / unstar a room.
+    SetFavourite { room: String, favourite: bool },
+    /// Joined spaces with the rooms they contain.
+    Spaces,
     /// Mark the room read up to the given event: public read receipt plus
     /// the fully-read marker, so every client and device agrees.
     MarkRead { room: String, event_id: String },
@@ -338,6 +342,11 @@ pub struct RoomInfo {
     pub notifications: u64,
     /// all | mentions | mute — how this room should notify.
     pub notification_mode: String,
+    pub favourite: bool,
+    pub low_priority: bool,
+    /// Milliseconds of the latest activity the server told us about.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_activity: Option<u64>,
     /// Our read receipt / fully-read marker, if we have one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub read_marker: Option<String>,
@@ -448,6 +457,16 @@ pub struct ReceiptInfo {
     /// Users whose read receipt moved, and the event it now points at.
     pub event_id: String,
     pub users: Vec<UserRef>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SpaceInfo {
+    pub id: String,
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub avatar: Option<String>,
+    /// Room ids this space lists as children (rooms and sub-spaces).
+    pub children: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]

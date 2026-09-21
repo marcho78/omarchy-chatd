@@ -112,6 +112,8 @@ the response echoes.
 | `invite` / `kick` / `ban` | `room`, `user`, `reason?` | `{}` |
 | `set_name` / `set_topic` | `room`, `name` / `topic` | `{}` |
 | `set_notification_mode` | `room`, `mode` (all, mentions, mute, default) | room details |
+| `set_favourite` | `room`, `favourite` | `{}` |
+| `spaces` | | `[{id, name, avatar?, children}]` — joined spaces (excluded from `rooms`) |
 | `mark_read` | `room`, `event_id` | `{}` — public read receipt and fully-read marker |
 | `search_rooms` | `query`, `server?`, `limit` | `[{id, name, alias?, topic?, members, joined}]` |
 | `join` | `room` (alias or id) | room info |
@@ -136,7 +138,8 @@ A `message` is `{room, event_id, sender, sender_name, body, html?, msgtype, ts, 
 text; `reactions` is `[{key, count, senders: [{id, name, reaction_id}], mine?}]`; `read_by`
 lists others whose read receipt points here; a deleted message keeps its place with `deleted: true`.
 Rooms and senders carry `avatar` / `sender_avatar` mxc URLs. Live messages carry the
-push-rule verdict as `notify` and `highlight`; rooms carry `notification_mode`. Membership changes come as
+push-rule verdict as `notify` and `highlight`; rooms carry `notification_mode`, `favourite`,
+`low_priority` and `last_activity` (ms of the latest message, seeded from the server once per room). Membership changes come as
 `msgtype: "system"` messages whose body is the line to show ("X joined").
 — `attachment` is `{kind, name, caption?, mime?, size?, width?, height?, has_thumbnail}` for
 `m.image`, `m.file`, `m.video` and `m.audio`
@@ -208,7 +211,7 @@ package builds `--frozen`.
 
 ## Roadmap
 
-1. Spaces, favourites, sort (Tier 2).
+1. Search (Tier 2).
 3. **Keyring** — store passphrase in the Secret Service instead of `session.json`.
 
 ## License
