@@ -194,6 +194,10 @@ pub struct Message {
     pub sender: String,
     pub sender_name: String,
     pub body: String,
+    /// The HTML rendering when the sender provided one (formatted_body,
+    /// org.matrix.custom.html); clients fall back to `body`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub html: Option<String>,
     pub msgtype: String,
     /// Milliseconds since the Unix epoch, as reported by the origin server.
     pub ts: u64,

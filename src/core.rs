@@ -41,7 +41,7 @@ use matrix_sdk::{
             room::{
                 encryption::RoomEncryptionEventContent,
                 member::{MembershipState, OriginalSyncRoomMemberEvent, StrippedRoomMemberEvent},
-                message::{OriginalSyncRoomMessageEvent, RoomMessageEventContent},
+                message::{MessageFormat, MessageType, OriginalSyncRoomMessageEvent, RoomMessageEventContent},
             },
         },
         serde::Raw,
@@ -835,12 +835,21 @@ async fn to_message(room: &Room, ev: OriginalSyncRoomMessageEvent, encrypted: bo
         Ok(Some(m)) => m.name().to_owned(),
         _ => ev.sender.localpart().to_owned(),
     };
+    let html = match &ev.content.msgtype {
+        MessageType::Text(t) => t.formatted.as_ref(),
+        MessageType::Notice(n) => n.formatted.as_ref(),
+        MessageType::Emote(e) => e.formatted.as_ref(),
+        _ => None,
+    }
+    .filter(|f| f.format == MessageFormat::Html)
+    .map(|f| f.body.clone());
     Message {
         room: room.room_id().to_string(),
         event_id: ev.event_id.to_string(),
         sender: ev.sender.to_string(),
         sender_name,
         body: ev.content.body().to_owned(),
+        html,
         msgtype: ev.content.msgtype.msgtype().to_owned(),
         ts: ev.origin_server_ts.0.into(),
         encrypted,

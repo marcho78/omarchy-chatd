@@ -101,9 +101,10 @@ the response echoes.
 
 Responses: `{"id":…, "ok":true, "result":…}` or `{"id":…, "ok":false, "error":"…"}`.
 
-A `message` is `{room, event_id, sender, sender_name, body, msgtype, ts, encrypted}`
+A `message` is `{room, event_id, sender, sender_name, body, html?, msgtype, ts, encrypted}`
 — `ts` in milliseconds since the epoch, `encrypted` true when the event
-arrived as `m.room.encrypted` and was decrypted locally.
+arrived as `m.room.encrypted` and was decrypted locally, `html` the sender's
+formatted body when there is one.
 
 Unsolicited events; the first line on every new connection is a `state`:
 
