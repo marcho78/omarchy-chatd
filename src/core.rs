@@ -610,6 +610,10 @@ impl Core {
                 let event_id = self.send_file(&room, &path, caption).await?;
                 Ok(json!({ "event_id": event_id }))
             }
+            Command::SendVoice { room, path } => {
+                let event_id = self.send_voice(&room, &path).await?;
+                Ok(json!({ "event_id": event_id }))
+            }
             Command::AcceptInvite { room } => {
                 let room = self.room(&room).await?;
                 room.join().await.context("accepting invite")?;

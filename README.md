@@ -142,6 +142,7 @@ the response echoes.
 | `reset_recovery_key` | | `{recovery_key}` — the old key stops working |
 | `download` | `room`, `event_id`, `thumbnail?` | `{path, mime}` — decrypted into `~/.cache/omarchy-yapper/media/` (0600) |
 | `send_file` | `room`, `path`, `caption?` | `{event_id}` — encrypted in encrypted rooms; images carry their dimensions |
+| `send_voice` | `room`, `path` (a 16-bit PCM WAV, e.g. from `pw-record --format=s16`) | `{event_id}` — encoded to Ogg/Opus with ffmpeg (the WAV is sent as-is without it), sent as an MSC3245 voice message with duration and a 100-point waveform; the file is deleted afterwards |
 
 Responses: `{"id":…, "ok":true, "result":…}` or `{"id":…, "ok":false, "error":"…"}`.
 
@@ -223,7 +224,6 @@ package builds `--frozen`.
 
 ## Roadmap
 
-1. **Voice messages / calls** — audio attachments and Element Call links.
 2. **Multiple accounts** — one daemon, several sessions.
 
 ## License

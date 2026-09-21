@@ -258,6 +258,13 @@ pub enum Command {
         #[serde(default)]
         thumbnail: bool,
     },
+    /// Send a recorded WAV as a voice message: encoded to Ogg/Opus, with
+    /// duration and waveform so other clients draw it as one. The file is
+    /// removed afterwards.
+    SendVoice {
+        room: String,
+        path: String,
+    },
     /// Upload a local file as an attachment (encrypted in encrypted rooms).
     SendFile {
         room: String,
@@ -735,4 +742,12 @@ pub struct Attachment {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub height: Option<u64>,
     pub has_thumbnail: bool,
+    /// An audio clip recorded as a voice message (MSC3245).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub voice: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
+    /// Amplitude samples, 0–1024, as the sender published them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub waveform: Option<Vec<u16>>,
 }

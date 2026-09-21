@@ -13,7 +13,7 @@ use std::{
 
 use anyhow::{Context, Result, anyhow, bail};
 use matrix_sdk::{
-    attachment::{AttachmentConfig, AttachmentInfo, BaseFileInfo, BaseImageInfo},
+    attachment::{AttachmentConfig, AttachmentInfo, BaseAudioInfo, BaseFileInfo, BaseImageInfo},
     media::{MediaEventContent, MediaThumbnailSettings},
     ruma::{
         EventId, UInt,
@@ -94,10 +94,38 @@ pub fn attachment_of(msgtype: &MessageType) -> Option<Attachment> {
         }
         _ => return None,
     };
+    // Voice messages carry their length and waveform in the MSC3245 blocks;
+    // plain audio may still say how long it is in `info`.
+    let (voice, duration_ms, waveform) = match msgtype {
+        MessageType::Audio(c) => (
+            c.voice.is_some(),
+            c.audio
+                .as_ref()
+                .map(|a| a.duration.as_millis() as u64)
+                .or_else(|| {
+                    c.info
+                        .as_deref()
+                        .and_then(|i| i.duration)
+                        .map(|d| d.as_millis() as u64)
+                }),
+            c.audio.as_ref().and_then(|a| {
+                (!a.waveform.is_empty()).then(|| {
+                    a.waveform
+                        .iter()
+                        .map(|v| u16::try_from(u64::from(v.get())).unwrap_or(u16::MAX))
+                        .collect::<Vec<u16>>()
+                })
+            }),
+        ),
+        _ => (false, None, None),
+    };
     Some(Attachment {
         kind: kind.to_owned(),
         name,
         caption,
+        voice,
+        duration_ms,
+        waveform,
         mime,
         size,
         width,
@@ -279,6 +307,137 @@ impl Core {
         info!(room = %room.room_id(), file = %name, "attachment sent");
         Ok(resp.event_id.to_string())
     }
+
+    /// A recorded WAV (16-bit PCM, as `pw-record --format=s16` writes)
+    /// becomes an Opus voice message. The waveform is 100 loudness samples
+    /// of the recording; ffmpeg does the encoding, and without it the WAV
+    /// itself is sent, still flagged as a voice message.
+    pub(crate) async fn send_voice(&self, room_id: &str, path: &str) -> Result<String> {
+        let room = self.room(room_id).await?;
+        let wav_path = PathBuf::from(path);
+        let wav =
+            std::fs::read(&wav_path).with_context(|| format!("reading {}", wav_path.display()))?;
+        let (duration, waveform) = analyse_wav(&wav).context("reading the recording")?;
+        if duration < std::time::Duration::from_millis(300) {
+            let _ = std::fs::remove_file(&wav_path);
+            bail!("the recording is too short");
+        }
+        let ogg_path = wav_path.with_extension("ogg");
+        let encoded = tokio::process::Command::new("ffmpeg")
+            .args(["-y", "-loglevel", "error", "-i"])
+            .arg(&wav_path)
+            .args(["-c:a", "libopus", "-b:a", "32k", "-application", "voip"])
+            .arg(&ogg_path)
+            .status()
+            .await
+            .map(|st| st.success())
+            .unwrap_or(false);
+        let (data, mime, name) = if encoded {
+            (
+                std::fs::read(&ogg_path).context("reading the encoded voice message")?,
+                "audio/ogg".parse::<mime::Mime>().expect("static mime"),
+                "Voice message.ogg",
+            )
+        } else {
+            tracing::warn!("ffmpeg unavailable or failed; sending the WAV as recorded");
+            (
+                wav,
+                "audio/wav".parse::<mime::Mime>().expect("static mime"),
+                "Voice message.wav",
+            )
+        };
+        let _ = std::fs::remove_file(&wav_path);
+        let _ = std::fs::remove_file(&ogg_path);
+        if data.len() as u64 > MAX_UPLOAD {
+            bail!("the recording is too large");
+        }
+        let info = AttachmentInfo::Voice(BaseAudioInfo {
+            duration: Some(duration),
+            size: UInt::new(data.len() as u64),
+            waveform: Some(waveform),
+        });
+        let resp = room
+            .send_attachment(name, &mime, data, AttachmentConfig::new().info(info))
+            .await
+            .context("uploading the voice message")?;
+        info!(room = %room.room_id(), secs = duration.as_secs_f32(), "voice message sent");
+        Ok(resp.event_id.to_string())
+    }
+}
+
+/// Duration and a 100-point loudness curve (0–1) of a PCM WAV. Handles the
+/// common layouts: 16-bit or 32-bit integer samples, any channel count.
+fn analyse_wav(bytes: &[u8]) -> Result<(std::time::Duration, Vec<f32>)> {
+    if bytes.len() < 12 || &bytes[0..4] != b"RIFF" || &bytes[8..12] != b"WAVE" {
+        bail!("not a WAV file");
+    }
+    let (mut channels, mut rate, mut bits) = (1u16, 48000u32, 16u16);
+    let mut data: Option<&[u8]> = None;
+    let mut pos = 12;
+    while pos + 8 <= bytes.len() {
+        let id = &bytes[pos..pos + 4];
+        let len = u32::from_le_bytes([
+            bytes[pos + 4],
+            bytes[pos + 5],
+            bytes[pos + 6],
+            bytes[pos + 7],
+        ]) as usize;
+        let body = &bytes[pos + 8..(pos + 8 + len).min(bytes.len())];
+        match id {
+            b"fmt " if body.len() >= 16 => {
+                channels = u16::from_le_bytes([body[2], body[3]]).max(1);
+                rate = u32::from_le_bytes([body[4], body[5], body[6], body[7]]).max(1);
+                bits = u16::from_le_bytes([body[14], body[15]]);
+            }
+            b"data" => data = Some(body),
+            _ => {}
+        }
+        pos += 8 + len + (len & 1);
+    }
+    let data = data.ok_or_else(|| anyhow!("no audio data"))?;
+    let bytes_per_sample = match bits {
+        16 => 2,
+        32 => 4,
+        other => bail!("unsupported sample size: {other} bits"),
+    };
+    let frame = bytes_per_sample * channels as usize;
+    let frames = data.len() / frame.max(1);
+    let duration = std::time::Duration::from_secs_f64(frames as f64 / rate as f64);
+    // RMS per bucket, normalised to the loudest bucket.
+    const BUCKETS: usize = 100;
+    let mut curve = vec![0f32; BUCKETS];
+    if frames > 0 {
+        let per = (frames / BUCKETS).max(1);
+        for (b, slot) in curve.iter_mut().enumerate() {
+            let start = b * per;
+            let end = ((b + 1) * per).min(frames);
+            if start >= end {
+                break;
+            }
+            let mut acc = 0f64;
+            let mut n = 0usize;
+            for f in start..end {
+                let off = f * frame;
+                let v = if bits == 16 {
+                    i16::from_le_bytes([data[off], data[off + 1]]) as f64 / i16::MAX as f64
+                } else {
+                    i32::from_le_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]])
+                        as f64
+                        / i32::MAX as f64
+                };
+                acc += v * v;
+                n += 1;
+            }
+            *slot = (acc / n.max(1) as f64).sqrt() as f32;
+        }
+        let peak = curve.iter().cloned().fold(0f32, f32::max);
+        if peak > 0.0 {
+            for v in curve.iter_mut() {
+                *v = (*v / peak).clamp(0.0, 1.0);
+            }
+        }
+    }
+    Ok((duration, curve))
 }
 
 async fn fetch(
