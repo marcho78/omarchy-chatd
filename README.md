@@ -110,7 +110,8 @@ the response echoes.
 | `logout` | | status |
 | `rooms` | | `[{id, name, topic?, encrypted, direct, unread, highlights, notifications, read_marker?}]`, unread first — `unread` is the local count since our receipt, `notifications` the server's |
 | `timeline` | `room`, `limit` (default 50, max 200), `before?` | `{messages, next?}` — oldest first; pass `next` as `before` for the page before; no `next` at the start of history. Served from the SDK's event cache (persisted across restarts): opening a room is a local read, and only history never seen goes to the server |
-| `send` | `room`, `body` (CommonMark; markup becomes `formatted_body`), `reply_to?` | `{event_id}` |
+| `send` | `room`, `body` (CommonMark; markup becomes `formatted_body`), `reply_to?`, `thread?` (root event id: send into that thread; with `reply_to`, a reply within it) | `{event_id}` |
+| `thread` | `room`, `root`, `limit`, `before?` | `{messages, next?}` — the root first (on the last page), then replies oldest first, from the SDK's thread cache; same paging as `timeline` |
 | `edit` | `room`, `event_id`, `body` | `{event_id}` — replaces one of our messages |
 | `delete` | `room`, `event_id` | `{}` — redacts one of our messages |
 | `react` / `unreact` | `room`, `event_id`, `key` / `room`, `reaction_id` | `{reaction_id}` / `{}` |
@@ -222,9 +223,8 @@ package builds `--frozen`.
 
 ## Roadmap
 
-1. **Threads** — `m.thread` relations and a thread view.
-2. **Voice messages / calls** — audio attachments and Element Call links.
-3. **Multiple accounts** — one daemon, several sessions.
+1. **Voice messages / calls** — audio attachments and Element Call links.
+2. **Multiple accounts** — one daemon, several sessions.
 
 ## License
 

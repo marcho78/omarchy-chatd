@@ -61,6 +61,19 @@ pub enum Command {
         body: String,
         #[serde(default)]
         reply_to: Option<String>,
+        /// Send into the thread under this root (reply_to then means a
+        /// reply within the thread).
+        #[serde(default)]
+        thread: Option<String>,
+    },
+    /// A thread's messages, root first, then replies oldest first.
+    Thread {
+        room: String,
+        root: String,
+        #[serde(default = "default_limit")]
+        limit: u32,
+        #[serde(default)]
+        before: Option<String>,
     },
     /// Replace the text of one of our own messages.
     Edit {
@@ -510,6 +523,25 @@ pub struct Message {
     pub notify: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub highlight: Option<bool>,
+    /// Set on a reply inside a thread: the thread's root event. Such
+    /// messages are left out of the room timeline and shown in the thread.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thread_root: Option<String>,
+    /// Set on a message that has a thread under it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thread: Option<ThreadInfo>,
+}
+
+/// What a thread root shows in the room timeline.
+#[derive(Debug, Clone, Serialize)]
+pub struct ThreadInfo {
+    pub replies: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latest_ts: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latest_sender: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latest_sender_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]

@@ -70,7 +70,7 @@ use crate::protocol::{
     Command, DirectoryRoom, DirectoryUser, Event, InviteInfo, LinkPreview, MemberInfo, Message,
     MessageEdit, Reaction, ReactionEvent, ReactionSender, ReceiptInfo, Redaction, ReplyPreview,
     Request, Response, RoomDetails, RoomInfo, SearchHit, SearchResults, SpaceInfo, Status,
-    TimelinePage, TypingInfo, UserRef,
+    ThreadInfo, TimelinePage, TypingInfo, UserRef,
 };
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -405,10 +405,19 @@ impl Core {
                 room,
                 body,
                 reply_to,
+                thread,
             } => {
-                let event_id = self.send(&room, body, reply_to).await?;
+                let event_id = self.send(&room, body, reply_to, thread).await?;
                 Ok(json!({ "event_id": event_id }))
             }
+            Command::Thread {
+                room,
+                root,
+                limit,
+                before,
+            } => Ok(serde_json::to_value(
+                self.thread(&room, &root, limit, before).await?,
+            )?),
             Command::Edit {
                 room,
                 event_id,
@@ -1411,7 +1420,7 @@ impl Core {
             }
         }
         let exhausted = consumed >= events.len();
-        let next = if exhausted && reached_start {
+        let next = if (exhausted && reached_start) || consumed == 0 {
             None
         } else {
             events[events.len() - consumed]
@@ -1423,11 +1432,18 @@ impl Core {
         // them together rather than one after another.
         let converted = futures_util::future::join_all(
             to_convert
-                .into_iter()
-                .map(|ev| self.message_from_event(&room, ev)),
+                .iter()
+                .map(|ev| self.message_from_event(&room, ev.clone())),
         )
         .await;
-        let mut out: Vec<Message> = converted.into_iter().flatten().collect();
+        let mut to_convert_ids = Vec::with_capacity(to_convert.len());
+        let mut out: Vec<Message> = Vec::with_capacity(to_convert.len());
+        for (ev, m) in to_convert.into_iter().zip(converted) {
+            if let Some(m) = m {
+                to_convert_ids.push(ev);
+                out.push(m);
+            }
+        }
         tracing::debug!(
             room = room_id,
             messages = out.len(),
@@ -1455,12 +1471,18 @@ impl Core {
         for (m, (reactions, edit, read_by)) in out.iter_mut().zip(decorated) {
             m.reactions = reactions;
             m.read_by = read_by;
-            if let Some((_, body, html)) = edit {
-                if !m.deleted {
-                    m.body = body;
-                    m.html = html;
-                    m.edited = true;
-                }
+            if let Some((_, body, html)) = edit
+                && !m.deleted
+            {
+                m.body = body;
+                m.html = html;
+                m.edited = true;
+            }
+        }
+        // Thread summaries: the cache keeps one on every root it knows of.
+        for (m, ev) in out.iter_mut().zip(to_convert_ids.iter()) {
+            if let Some(summary) = ev.thread_summary.summary() {
+                m.thread = Some(thread_info(&room, &cache, summary).await);
             }
         }
         tracing::debug!(
@@ -1469,6 +1491,189 @@ impl Core {
             "timeline: done"
         );
         out.reverse(); // newest-first walk; the page reads oldest-first
+        Ok(TimelinePage {
+            messages: out,
+            next,
+        })
+    }
+
+    /// A thread: its root, then the replies oldest first, from the SDK's
+    /// thread cache (sync-fed, back-paginated through /relations).
+    async fn thread(
+        &self,
+        room_id: &str,
+        root_id: &str,
+        limit: u32,
+        before: Option<String>,
+    ) -> Result<TimelinePage> {
+        let room = self.room(room_id).await?;
+        let client = room.client();
+        let root = matrix_sdk::ruma::EventId::parse(root_id).context("invalid thread root")?;
+        let limit = limit.clamp(1, 200) as usize;
+        let before = before.filter(|t| !t.is_empty());
+        let (cache, _handles) = client
+            .event_cache()
+            .thread(room.room_id(), &root)
+            .await
+            .context("opening the thread")?;
+
+        // Hold one subscriber for the whole read: dropping one lets the
+        // cache shrink its in-memory chunk, which would discard replies
+        // loaded a moment ago. Older pages are taken straight from the
+        // pagination outcome rather than re-read.
+        let (initial, _subscriber) = cache.subscribe().await.context("reading the thread")?;
+        let mut all: Vec<TimelineEvent> = initial
+            .into_iter()
+            .filter(|e| e.event_id().as_deref() != Some(&root))
+            .collect();
+        let mut reached_start = false;
+        let mut rounds = 0;
+        let events: Vec<TimelineEvent> = loop {
+            tracing::debug!(
+                room = room_id,
+                root = root_id,
+                cached = all.len(),
+                rounds,
+                reached_start,
+                "thread: cache"
+            );
+            let cut = match &before {
+                Some(id) => all
+                    .iter()
+                    .position(|e| e.event_id().is_some_and(|x| x.as_str() == id)),
+                None => Some(all.len()),
+            };
+            if let Some(cut) = cut {
+                let slice = &all[..cut];
+                let have = slice
+                    .iter()
+                    .rev()
+                    .filter(|e| is_thread_reply(e))
+                    .take(limit)
+                    .count();
+                if have >= limit || reached_start {
+                    break slice.to_vec();
+                }
+            } else if reached_start {
+                bail!("the earlier replies are no longer loaded; reopen the thread");
+            }
+            rounds += 1;
+            if rounds > 12 {
+                break cut.map(|c| all[..c].to_vec()).unwrap_or_default();
+            }
+            let outcome = cache
+                .pagination()
+                .run_backwards_once(limit.max(40) as u16)
+                .await
+                .context("loading earlier replies")?;
+            reached_start = outcome.reached_start;
+            // Newest-first from the server; prepend in timeline order.
+            let mut older: Vec<TimelineEvent> = outcome
+                .events
+                .into_iter()
+                .filter(|e| {
+                    let id = e.event_id();
+                    id.as_deref() != Some(&root) && !all.iter().any(|x| x.event_id() == id)
+                })
+                .collect();
+            older.reverse();
+            older.append(&mut all);
+            all = older;
+        };
+
+        let mut to_convert = Vec::new();
+        let mut redacted: std::collections::HashSet<String> = Default::default();
+        let mut consumed = 0usize;
+        let mut messages = 0usize;
+        for ev in events.iter().rev() {
+            if messages >= limit {
+                break;
+            }
+            consumed += 1;
+            if let Ok(AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::RoomRedaction(
+                matrix_sdk::ruma::events::room::redaction::SyncRoomRedactionEvent::Original(rd),
+            ))) = ev.raw().deserialize()
+            {
+                redacted.insert(
+                    rd.redacts(&room.clone_info().room_version_rules_or_default().redaction)
+                        .to_string(),
+                );
+                continue;
+            }
+            if is_thread_reply(ev) {
+                messages += 1;
+                to_convert.push(ev.clone());
+            }
+        }
+        let exhausted = consumed >= events.len();
+        let at_start = exhausted && reached_start;
+        let next = if at_start || consumed == 0 {
+            None
+        } else {
+            events[events.len() - consumed]
+                .event_id()
+                .map(|e| e.to_string())
+        };
+
+        let converted = futures_util::future::join_all(
+            to_convert
+                .into_iter()
+                .map(|ev| self.message_from_event(&room, ev)),
+        )
+        .await;
+        let mut out: Vec<Message> = converted.into_iter().flatten().collect();
+        let me = room.client().user_id().map(|u| u.to_owned());
+        let (room_cache, _h) = room
+            .event_cache()
+            .await
+            .context("opening the event cache")?;
+        let decorated = futures_util::future::join_all(out.iter().map(|m| {
+            let (room, cache, redacted, me) = (&room, &room_cache, &redacted, me.as_deref());
+            let event_id = m.event_id.clone();
+            async move {
+                let Ok(id) = matrix_sdk::ruma::OwnedEventId::try_from(event_id.as_str()) else {
+                    return (Vec::new(), None, Vec::new());
+                };
+                let (reactions, edit) = cached_relations(cache, &id).await;
+                let reactions = aggregate_reactions(room, reactions, me, redacted).await;
+                (reactions, edit, read_by(room, &event_id, me).await)
+            }
+        }))
+        .await;
+        for (m, (reactions, edit, read_by)) in out.iter_mut().zip(decorated) {
+            m.reactions = reactions;
+            m.read_by = read_by;
+            if let Some((_, body, html)) = edit
+                && !m.deleted
+            {
+                m.body = body;
+                m.html = html;
+                m.edited = true;
+            }
+        }
+        out.reverse();
+
+        // The root leads the first page.
+        if at_start || before.is_none() && out.is_empty() {
+            if let Ok(ev) = room.load_or_fetch_event(&root, None).await
+                && let Some(mut m) = self.message_from_event(&room, ev.clone()).await
+            {
+                let (reactions, edit) = cached_relations(&room_cache, &root).await;
+                m.reactions = aggregate_reactions(&room, reactions, me.as_deref(), &redacted).await;
+                m.read_by = read_by(&room, &m.event_id, me.as_deref()).await;
+                if let Some((_, body, html)) = edit
+                    && !m.deleted
+                {
+                    m.body = body;
+                    m.html = html;
+                    m.edited = true;
+                }
+                if let Some(summary) = ev.thread_summary.summary() {
+                    m.thread = Some(thread_info(&room, &room_cache, summary).await);
+                }
+                out.insert(0, m);
+            }
+        }
         Ok(TimelinePage {
             messages: out,
             next,
@@ -1526,6 +1731,8 @@ impl Core {
                     deleted: false,
                     notify: None,
                     highlight: None,
+                    thread_root: None,
+                    thread: None,
                 })
             }
             // A redacted message keeps its place with empty content — in an
@@ -1569,21 +1776,48 @@ impl Core {
                     deleted: false,
                     notify: None,
                     highlight: None,
+                    thread_root: None,
+                    thread: None,
                 })
             }
             _ => None,
         }
     }
 
-    async fn send(&self, room_id: &str, body: String, reply_to: Option<String>) -> Result<String> {
+    async fn send(
+        &self,
+        room_id: &str,
+        body: String,
+        reply_to: Option<String>,
+        thread: Option<String>,
+    ) -> Result<String> {
+        use matrix_sdk::room::reply::{EnforceThread, Reply};
+        use matrix_sdk::ruma::events::room::message::ReplyWithinThread;
         let room = self.room(room_id).await?;
-        let content = match reply_to.filter(|r| !r.is_empty()) {
-            Some(target) => {
+        let reply_to = reply_to.filter(|r| !r.is_empty());
+        let thread = thread.filter(|r| !r.is_empty());
+        // In a thread, a plain message relates to the root; a reply relates
+        // to its target and stays in the thread.
+        let target = match (&reply_to, &thread) {
+            (Some(r), _) => Some((r.clone(), thread.is_some())),
+            (None, Some(root)) => Some((root.clone(), false)),
+            (None, None) => None,
+        };
+        let content = match target {
+            Some((target, within_thread)) => {
                 let target =
                     matrix_sdk::ruma::EventId::parse(&target).context("invalid reply target")?;
-                let reply = matrix_sdk::room::reply::Reply {
+                let reply = Reply {
                     event_id: target,
-                    enforce_thread: matrix_sdk::room::reply::EnforceThread::MaybeThreaded,
+                    enforce_thread: if thread.is_some() {
+                        EnforceThread::Threaded(if within_thread {
+                            ReplyWithinThread::Yes
+                        } else {
+                            ReplyWithinThread::No
+                        })
+                    } else {
+                        EnforceThread::MaybeThreaded
+                    },
                     add_mentions: AddMentions::Yes,
                 };
                 room.make_reply_event(
@@ -1790,6 +2024,49 @@ async fn cached_relations(
     (reactions, edit)
 }
 
+/// A message inside a thread (not an edit, reaction or redaction).
+fn is_thread_reply(ev: &TimelineEvent) -> bool {
+    let raw = ev.raw();
+    let Ok(Some(kind)) = raw.get_field::<String>("type") else {
+        return false;
+    };
+    match kind.as_str() {
+        "m.room.encrypted" | "m.sticker" => true,
+        "m.room.message" => {
+            let rel: Option<serde_json::Value> = raw.get_field("content").ok().flatten();
+            rel.as_ref()
+                .and_then(|c| c.get("m.relates_to"))
+                .and_then(|r| r.get("rel_type"))
+                .and_then(|t| t.as_str())
+                != Some("m.replace")
+        }
+        _ => false,
+    }
+}
+
+/// What the timeline shows under a thread root, from the cache's summary.
+async fn thread_info(
+    room: &Room,
+    cache: &matrix_sdk::event_cache::RoomEventCache,
+    summary: &matrix_sdk::deserialized_responses::ThreadSummary,
+) -> ThreadInfo {
+    let mut info = ThreadInfo {
+        replies: summary.num_replies,
+        latest_ts: None,
+        latest_sender: None,
+        latest_sender_name: None,
+    };
+    if let Some(latest) = &summary.latest_reply
+        && let Ok(Some(ev)) = cache.find_event(latest).await
+        && let Ok(AnySyncTimelineEvent::MessageLike(m)) = ev.raw().deserialize()
+    {
+        info.latest_ts = Some(u64::from(m.origin_server_ts().0));
+        info.latest_sender = Some(m.sender().to_string());
+        info.latest_sender_name = Some(user_ref(room, m.sender()).await.name);
+    }
+    info
+}
+
 /// Whether an event becomes a line in the timeline: a message (not an
 /// edit), an encrypted event, or a membership change.
 fn is_message_like(ev: &TimelineEvent) -> bool {
@@ -1801,11 +2078,12 @@ fn is_message_like(ev: &TimelineEvent) -> bool {
         "m.room.encrypted" | "m.room.member" | "m.sticker" => true,
         "m.room.message" => {
             let rel: Option<serde_json::Value> = raw.get_field("content").ok().flatten();
-            rel.as_ref()
+            let rel_type = rel
+                .as_ref()
                 .and_then(|c| c.get("m.relates_to"))
                 .and_then(|r| r.get("rel_type"))
-                .and_then(|t| t.as_str())
-                != Some("m.replace")
+                .and_then(|t| t.as_str());
+            rel_type != Some("m.replace") && rel_type != Some("m.thread")
         }
         _ => false,
     }
@@ -1882,11 +2160,21 @@ async fn to_message(room: &Room, ev: OriginalSyncRoomMessageEvent, encrypted: bo
         _ => (ev.sender.localpart().to_owned(), None),
     };
     let html = formatted_html(&ev.content.msgtype);
-    let reply_to = match &ev.content.relates_to {
-        Some(Relation::Reply(in_reply_to)) => {
-            reply_preview(room, &in_reply_to.in_reply_to.event_id).await
-        }
-        _ => None,
+    // A thread reply quotes only when it is a real reply within the thread;
+    // the fallback in_reply_to (the thread's latest message) is not one.
+    let (reply_to, thread_root) = match &ev.content.relates_to {
+        Some(Relation::Reply(in_reply_to)) => (
+            reply_preview(room, &in_reply_to.in_reply_to.event_id).await,
+            None,
+        ),
+        Some(Relation::Thread(t)) => (
+            match &t.in_reply_to {
+                Some(r) if !t.is_falling_back => reply_preview(room, &r.event_id).await,
+                _ => None,
+            },
+            Some(t.event_id.to_string()),
+        ),
+        _ => (None, None),
     };
     let body = if reply_to.is_some() {
         strip_reply_fallback(ev.content.body())
@@ -1913,6 +2201,8 @@ async fn to_message(room: &Room, ev: OriginalSyncRoomMessageEvent, encrypted: bo
         deleted: false,
         notify: None,
         highlight: None,
+        thread_root,
+        thread: None,
     }
 }
 
@@ -1946,6 +2236,8 @@ async fn deleted_placeholder(
         deleted: true,
         notify: None,
         highlight: None,
+        thread_root: None,
+        thread: None,
     }
 }
 
