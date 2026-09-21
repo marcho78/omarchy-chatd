@@ -100,7 +100,7 @@ the response echoes.
 | `login` | `homeserver`, `username`, `password` | status |
 | `logout` | | status |
 | `rooms` | | `[{id, name, topic?, encrypted, direct, unread, highlights, notifications, read_marker?}]`, unread first — `unread` is the local count since our receipt, `notifications` the server's |
-| `timeline` | `room`, `limit` (default 50, max 200), `before?` | `{messages, next?}` — oldest first; pass `next` as `before` for the page before; no `next` at the start of history |
+| `timeline` | `room`, `limit` (default 50, max 200), `before?` | `{messages, next?}` — oldest first; pass `next` as `before` for the page before; no `next` at the start of history. Served from the SDK's event cache (persisted across restarts): opening a room is a local read, and only history never seen goes to the server |
 | `send` | `room`, `body` (CommonMark; markup becomes `formatted_body`), `reply_to?` | `{event_id}` |
 | `edit` | `room`, `event_id`, `body` | `{event_id}` — replaces one of our messages |
 | `delete` | `room`, `event_id` | `{}` — redacts one of our messages |

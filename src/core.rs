@@ -24,6 +24,7 @@ use matrix_sdk::{
     },
     config::SyncSettings,
     deserialized_responses::EncryptionInfo,
+    deserialized_responses::TimelineEvent,
     event_handler::Ctx,
     room::MessagesOptions,
     ruma::{
@@ -41,6 +42,7 @@ use matrix_sdk::{
             reaction::{OriginalSyncReactionEvent, ReactionEventContent},
             receipt::ReceiptThread,
             receipt::{ReceiptType as EphemeralReceiptType, SyncReceiptEvent},
+            relation::RelationType,
             relation::{Annotation, Replacement},
             room::{
                 encryption::RoomEncryptionEventContent,
@@ -140,16 +142,6 @@ pub struct Core {
     /// Verification flows we are tracking: flow id -> other user.
     pub(crate) flows:
         tokio::sync::Mutex<std::collections::HashMap<String, matrix_sdk::ruma::OwnedUserId>>,
-    /// Reactions seen on a page whose target message was not on it: they
-    /// come from a newer page than the message they belong to, so keep
-    /// them per room until the target's page is loaded.
-    /// room -> target event -> (key, sender, reaction event id)
-    pending_reactions: tokio::sync::Mutex<
-        std::collections::HashMap<
-            String,
-            std::collections::HashMap<String, Vec<(String, matrix_sdk::ruma::OwnedUserId, String)>>,
-        >,
-    >,
     /// room -> timestamp of its latest message: seeded from the server the
     /// first time a room is listed, then kept current by incoming events.
     activity: Arc<tokio::sync::Mutex<std::collections::HashMap<String, u64>>>,
@@ -173,7 +165,6 @@ impl Core {
             events,
             state: Default::default(),
             flows: Default::default(),
-            pending_reactions: Default::default(),
             activity: Default::default(),
         }))
     }
@@ -1137,94 +1128,165 @@ impl Core {
         Ok(out)
     }
 
+    /// One page of a room's history, newest page first, from the SDK's
+    /// event cache. The cache already holds what sync delivered (persisted
+    /// across restarts), so opening a room is a local read; only history we
+    /// have never seen goes to the server, through the cache's own
+    /// back-pagination, which also fills any gap sync left behind.
+    ///
+    /// `before` is the id of the oldest event on the previous page; `next`
+    /// hands back the id to pass for the page after this one.
     async fn timeline(
         &self,
         room_id: &str,
         limit: u32,
         before: Option<String>,
     ) -> Result<TimelinePage> {
+        let started = std::time::Instant::now();
         let room = self.room(room_id).await?;
-        let mut from = before.filter(|t| !t.is_empty());
-        let mut out = Vec::new();
-        let mut next: Option<String> = None;
-        // A chunk can be nothing but state events (room creation, joins);
-        // keep going so a page always carries messages or the real end.
-        // Reactions on this page keyed by their target; plus any carried
-        // over from newer pages whose targets we are about to see.
-        let mut reactions: std::collections::HashMap<
-            String,
-            Vec<(String, matrix_sdk::ruma::OwnedUserId, String)>,
-        > = {
-            let mut p = self.pending_reactions.lock().await;
-            p.remove(room_id).unwrap_or_default()
-        };
-        let mut redacted: std::collections::HashSet<String> = Default::default();
-        for _ in 0..6 {
-            let mut opts = MessagesOptions::backward();
-            opts.limit = UInt::from(limit.clamp(1, 200));
-            opts.from = from.clone();
-            let page = room.messages(opts).await.context("fetching messages")?;
-            let raw_count = page.chunk.len();
-            for ev in page.chunk {
-                if let Ok(AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::Reaction(
-                    SyncMessageLikeEvent::Original(r),
-                ))) = ev.raw().deserialize()
-                {
-                    let a = &r.content.relates_to;
-                    reactions.entry(a.event_id.to_string()).or_default().push((
-                        a.key.clone(),
-                        r.sender.clone(),
-                        r.event_id.to_string(),
-                    ));
-                    continue;
-                }
-                if let Ok(AnySyncTimelineEvent::MessageLike(
-                    AnySyncMessageLikeEvent::RoomRedaction(
-                        matrix_sdk::ruma::events::room::redaction::SyncRoomRedactionEvent::Original(
-                            rd,
-                        ),
-                    ),
-                )) = ev.raw().deserialize()
-                {
-                    redacted.insert(
-                        rd.redacts(&room.clone_info().room_version_rules_or_default().redaction)
-                            .to_string(),
-                    );
-                    continue;
-                }
-                if let Some(m) = self.message_from_event(&room, ev).await {
-                    out.push(m);
-                }
-            }
-            // The server omits `end` when there is nothing further back, and
-            // under-fills a chunk only at the start of history — matrix.org
-            // sends a cursor either way, so use the fill as the signal.
-            next = if raw_count < limit.clamp(1, 200) as usize {
-                None
-            } else {
-                page.end.clone()
+        let limit = limit.clamp(1, 200) as usize;
+        let before = before.filter(|t| !t.is_empty());
+        let (cache, _handles) = room
+            .event_cache()
+            .await
+            .context("opening the event cache")?;
+
+        // Load until the events before the anchor hold a page's worth of
+        // messages with no gap between them and the live end.
+        let mut reached_start = false;
+        let mut rounds = 0;
+        let events: Vec<TimelineEvent> = loop {
+            let all = cache.events().await.context("reading the event cache")?;
+            // Only the events after the most recent unresolved gap are known
+            // to run straight up to the live end.
+            let tail = contiguous_tail(&cache.debug_string().await).min(all.len());
+            let all = &all[all.len() - tail..];
+            let cut = match &before {
+                Some(id) => all
+                    .iter()
+                    .position(|e| e.event_id().is_some_and(|x| x.as_str() == id)),
+                None => Some(all.len()),
             };
-            if !out.is_empty() || next.is_none() {
+            if let Some(cut) = cut {
+                let slice = &all[..cut];
+                let have = slice
+                    .iter()
+                    .rev()
+                    .filter(|e| is_message_like(e))
+                    .take(limit)
+                    .count();
+                if have >= limit || reached_start {
+                    break slice.to_vec();
+                }
+            } else if reached_start {
+                bail!("the earlier messages are no longer loaded; reopen the room");
+            }
+            rounds += 1;
+            if rounds > 12 {
+                // Enough history for anyone in one go; the next page continues.
+                break cut.map(|c| all[..c].to_vec()).unwrap_or_default();
+            }
+            let t = std::time::Instant::now();
+            let outcome = cache
+                .pagination()
+                .run_backwards_once(limit.max(40) as u16)
+                .await
+                .context("loading earlier messages")?;
+            tracing::debug!(
+                room = room_id,
+                loaded = outcome.events.len(),
+                reached_start = outcome.reached_start,
+                ms = t.elapsed().as_millis() as u64,
+                "timeline: back-paginated"
+            );
+            reached_start = outcome.reached_start;
+        };
+
+        // Walk newest-first, converting message-like events until the page
+        // is full. Everything older stays for the next page.
+        let mut to_convert = Vec::new();
+        let mut redacted: std::collections::HashSet<String> = Default::default();
+        let mut consumed = 0usize;
+        let mut messages = 0usize;
+        for ev in events.iter().rev() {
+            if messages >= limit {
                 break;
             }
-            from = next.clone();
-        }
-        let me = room.client().user_id().map(|u| u.to_owned());
-        for m in out.iter_mut() {
-            if let Some(mut list) = reactions.remove(&m.event_id) {
-                list.reverse(); // collected newest-first; chips read oldest-first
-                m.reactions = aggregate_reactions(&room, list, me.as_deref(), &redacted).await;
+            consumed += 1;
+            if let Ok(AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::RoomRedaction(
+                matrix_sdk::ruma::events::room::redaction::SyncRoomRedactionEvent::Original(rd),
+            ))) = ev.raw().deserialize()
+            {
+                redacted.insert(
+                    rd.redacts(&room.clone_info().room_version_rules_or_default().redaction)
+                        .to_string(),
+                );
+                continue;
             }
-            m.read_by = read_by(&room, &m.event_id, me.as_deref()).await;
+            if is_message_like(ev) {
+                messages += 1;
+                to_convert.push(ev.clone());
+            }
         }
-        // Whatever is left targets messages on an older page.
-        if !reactions.is_empty() {
-            self.pending_reactions
-                .lock()
-                .await
-                .insert(room_id.to_owned(), reactions);
+        let exhausted = consumed >= events.len();
+        let next = if exhausted && reached_start {
+            None
+        } else {
+            events[events.len() - consumed]
+                .event_id()
+                .map(|e| e.to_string())
+        };
+
+        // Each message may need a member or a quoted event looked up; do
+        // them together rather than one after another.
+        let converted = futures_util::future::join_all(
+            to_convert
+                .into_iter()
+                .map(|ev| self.message_from_event(&room, ev)),
+        )
+        .await;
+        let mut out: Vec<Message> = converted.into_iter().flatten().collect();
+        tracing::debug!(
+            room = room_id,
+            messages = out.len(),
+            ms = started.elapsed().as_millis() as u64,
+            "timeline: converted"
+        );
+
+        // Reactions, edits and receipts come from the cache's relation index:
+        // anything relating to a message on this page is newer than it, so
+        // it is already loaded.
+        let me = room.client().user_id().map(|u| u.to_owned());
+        let decorated = futures_util::future::join_all(out.iter().map(|m| {
+            let (room, cache, redacted, me) = (&room, &cache, &redacted, me.as_deref());
+            let event_id = m.event_id.clone();
+            async move {
+                let Ok(id) = matrix_sdk::ruma::OwnedEventId::try_from(event_id.as_str()) else {
+                    return (Vec::new(), None, Vec::new());
+                };
+                let (reactions, edit) = cached_relations(cache, &id).await;
+                let reactions = aggregate_reactions(room, reactions, me, redacted).await;
+                (reactions, edit, read_by(room, &event_id, me).await)
+            }
+        }))
+        .await;
+        for (m, (reactions, edit, read_by)) in out.iter_mut().zip(decorated) {
+            m.reactions = reactions;
+            m.read_by = read_by;
+            if let Some((_, body, html)) = edit {
+                if !m.deleted {
+                    m.body = body;
+                    m.html = html;
+                    m.edited = true;
+                }
+            }
         }
-        out.reverse(); // backward pagination yields newest first
+        tracing::debug!(
+            room = room_id,
+            ms = started.elapsed().as_millis() as u64,
+            "timeline: done"
+        );
+        out.reverse(); // newest-first walk; the page reads oldest-first
         Ok(TimelinePage {
             messages: out,
             next,
@@ -1429,6 +1491,7 @@ async fn on_room_message(
     })) = &event.content.relates_to
     {
         let html = formatted_html(&new_content.msgtype);
+        forget_reply_preview(&room, event_id.as_str());
         let _ = ctx.events.send(Event::MessageEdited(MessageEdit {
             room: room.room_id().to_string(),
             event_id: event_id.to_string(),
@@ -1475,6 +1538,95 @@ fn bundled_edit(
         _ => None,
     };
     Some((body, html))
+}
+
+/// How many events at the end of the cache's linked chunk sit after its
+/// last gap, read from the cache's chunk listing (one line per chunk:
+/// `chunk #n: gap['token']` or `chunk #n: [#order: $id, …]`). Sync
+/// back-pagination resolves gaps newest-first, so this run is the part of
+/// history that is complete up to the live end.
+fn contiguous_tail(chunks: &[String]) -> usize {
+    let mut n = 0;
+    for line in chunks {
+        let Some((_, body)) = line.split_once(": ") else {
+            continue;
+        };
+        if body.starts_with("gap[") {
+            n = 0;
+        } else {
+            n += body.matches('#').count();
+        }
+    }
+    n
+}
+
+/// Reactions and the latest edit of a message, from the event cache's
+/// relation index. Anything relating to a message is newer than it, so once
+/// the message is loaded its relations are too.
+async fn cached_relations(
+    cache: &matrix_sdk::event_cache::RoomEventCache,
+    event_id: &matrix_sdk::ruma::EventId,
+) -> (
+    Vec<(String, matrix_sdk::ruma::OwnedUserId, String)>,
+    Option<(u64, String, Option<String>)>,
+) {
+    let related = cache
+        .find_event_relations(
+            event_id,
+            Some(vec![RelationType::Annotation, RelationType::Replacement]),
+        )
+        .await
+        .unwrap_or_default();
+    let mut reactions = Vec::new();
+    let mut edit: Option<(u64, String, Option<String>)> = None;
+    for rel in related {
+        match rel.raw().deserialize() {
+            Ok(AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::Reaction(
+                SyncMessageLikeEvent::Original(r),
+            ))) => reactions.push((
+                r.content.relates_to.key.clone(),
+                r.sender.clone(),
+                r.event_id.to_string(),
+            )),
+            Ok(AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::RoomMessage(
+                SyncMessageLikeEvent::Original(e),
+            ))) => {
+                if let Some(Relation::Replacement(rep)) = &e.content.relates_to {
+                    let ts = u64::from(e.origin_server_ts.0);
+                    if edit.as_ref().is_none_or(|(t, _, _)| ts >= *t) {
+                        edit = Some((
+                            ts,
+                            rep.new_content.msgtype.body().to_owned(),
+                            formatted_html(&rep.new_content.msgtype),
+                        ));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    (reactions, edit)
+}
+
+/// Whether an event becomes a line in the timeline: a message (not an
+/// edit), an encrypted event, or a membership change.
+fn is_message_like(ev: &TimelineEvent) -> bool {
+    let raw = ev.raw();
+    let Ok(Some(kind)) = raw.get_field::<String>("type") else {
+        return false;
+    };
+    match kind.as_str() {
+        "m.room.encrypted" | "m.room.member" | "m.sticker" => true,
+        "m.room.message" => {
+            let rel: Option<serde_json::Value> = raw.get_field("content").ok().flatten();
+            rel.as_ref()
+                .and_then(|c| c.get("m.relates_to"))
+                .and_then(|r| r.get("rel_type"))
+                .and_then(|t| t.as_str())
+                != Some("m.replace")
+        }
+        _ => false,
+    }
 }
 
 /// Matrix used to put a quoted fallback of the replied-to message at the top
@@ -2326,10 +2478,57 @@ impl Core {
 }
 
 /// A one-line preview of the message a reply points at.
+/// Reply previews already built, keyed by "room|event". A quoted message
+/// rarely changes (an edit invalidates it), and fetching each one from the
+/// server was what made reply-heavy rooms take seconds to open.
+static REPLY_CACHE: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<String, ReplyPreview>>,
+> = std::sync::OnceLock::new();
+
+fn reply_cache() -> &'static std::sync::Mutex<std::collections::HashMap<String, ReplyPreview>> {
+    REPLY_CACHE.get_or_init(Default::default)
+}
+
+fn forget_reply_preview(room: &Room, event_id: &str) {
+    if let Ok(mut c) = reply_cache().lock() {
+        c.remove(&format!("{}|{}", room.room_id(), event_id));
+    }
+}
+
 async fn reply_preview(room: &Room, event_id: &matrix_sdk::ruma::EventId) -> Option<ReplyPreview> {
-    let ev = room.event(event_id, None).await.ok()?;
+    let key = format!("{}|{}", room.room_id(), event_id);
+    if let Some(p) = reply_cache().lock().ok().and_then(|c| c.get(&key).cloned()) {
+        return Some(p);
+    }
+    let preview = build_reply_preview(room, event_id).await?;
+    if let Ok(mut c) = reply_cache().lock() {
+        c.insert(key, preview.clone());
+    }
+    Some(preview)
+}
+
+async fn build_reply_preview(
+    room: &Room,
+    event_id: &matrix_sdk::ruma::EventId,
+) -> Option<ReplyPreview> {
+    // The event cache (sync + earlier pages) answers instantly; only fall
+    // back to the server for something we have never seen.
+    let ev = tokio::time::timeout(
+        Duration::from_secs(5),
+        room.load_or_fetch_event(event_id, None),
+    )
+    .await
+    .ok()?
+    .ok()?;
     let parsed: AnySyncTimelineEvent = ev.raw().deserialize().ok()?;
-    let edited = bundled_edit(ev.raw()).map(|(b, _)| b);
+    // The quote shows the message as it reads now: the newest edit the
+    // cache knows of, else the one the server bundled.
+    let mut edited = bundled_edit(ev.raw()).map(|(b, _)| b);
+    if let Ok((cache, _handles)) = room.event_cache().await
+        && let (_, Some((_, body, _))) = cached_relations(&cache, event_id).await
+    {
+        edited = Some(body);
+    }
     let (sender, body) = match parsed {
         AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::RoomMessage(
             SyncMessageLikeEvent::Original(m),
