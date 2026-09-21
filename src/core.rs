@@ -248,6 +248,9 @@ impl Core {
     ) -> Result<()> {
         let client = Client::builder()
             .homeserver_url(&saved.homeserver)
+            .with_threading_support(matrix_sdk::ThreadingSupport::Enabled {
+                with_subscriptions: false,
+            })
             .handle_refresh_tokens()
             .sqlite_store(&saved.store_path, Some(&secrets.store_passphrase))
             .build()
@@ -524,8 +527,12 @@ impl Core {
                 self.search(&query, room.as_deref(), limit).await?,
             )?),
             Command::Preview { url } => Ok(serde_json::to_value(self.preview(&url).await?)?),
-            Command::MarkRead { room, event_id } => {
-                self.mark_read(&room, &event_id).await?;
+            Command::MarkRead {
+                room,
+                event_id,
+                thread,
+            } => {
+                self.mark_read(&room, &event_id, thread).await?;
                 Ok(json!({}))
             }
             Command::SearchRooms {
@@ -705,6 +712,9 @@ impl Core {
         let store_path = self.data_dir.join(format!("store-{store_name}"));
         let client = Client::builder()
             .server_name_or_homeserver_url(homeserver)
+            .with_threading_support(matrix_sdk::ThreadingSupport::Enabled {
+                with_subscriptions: false,
+            })
             .handle_refresh_tokens()
             .sqlite_store(&store_path, Some(&store_passphrase))
             .build()
@@ -1154,12 +1164,26 @@ impl Core {
                             AnySyncMessageLikeEvent::RoomMessage(_)
                                 | AnySyncMessageLikeEvent::RoomEncrypted(_)
                         );
-                        if is_msg {
+                        // Thread replies count in their thread, not the room.
+                        let in_thread = ev
+                            .raw()
+                            .get_field::<serde_json::Value>("content")
+                            .ok()
+                            .flatten()
+                            .and_then(|c| {
+                                c.get("m.relates_to")?
+                                    .get("rel_type")?
+                                    .as_str()
+                                    .map(|t| t == "m.thread")
+                            })
+                            .unwrap_or(false);
+                        if is_msg && !in_thread {
                             last_activity = Some(last_activity.map_or(ts, |t| t.max(ts)));
-                            if let (Some(me), Some(at)) = (me.as_deref(), read_at) {
-                                if m.sender() != me && ts > at {
-                                    n += 1;
-                                }
+                            if let (Some(me), Some(at)) = (me.as_deref(), read_at)
+                                && m.sender() != me
+                                && ts > at
+                            {
+                                n += 1;
                             }
                         }
                     }
@@ -1464,7 +1488,7 @@ impl Core {
                 };
                 let (reactions, edit) = cached_relations(cache, &id).await;
                 let reactions = aggregate_reactions(room, reactions, me, redacted).await;
-                (reactions, edit, read_by(room, &event_id, me).await)
+                (reactions, edit, read_by(room, &event_id, me, None).await)
             }
         }))
         .await;
@@ -1481,8 +1505,10 @@ impl Core {
         }
         // Thread summaries: the cache keeps one on every root it knows of.
         for (m, ev) in out.iter_mut().zip(to_convert_ids.iter()) {
-            if let Some(summary) = ev.thread_summary.summary() {
-                m.thread = Some(thread_info(&room, &cache, summary).await);
+            if let Some(summary) = ev.thread_summary.summary()
+                && let Ok(id) = matrix_sdk::ruma::OwnedEventId::try_from(m.event_id.as_str())
+            {
+                m.thread = Some(thread_info(&room, &cache, &id, summary).await);
             }
         }
         tracing::debug!(
@@ -1628,7 +1654,8 @@ impl Core {
             .await
             .context("opening the event cache")?;
         let decorated = futures_util::future::join_all(out.iter().map(|m| {
-            let (room, cache, redacted, me) = (&room, &room_cache, &redacted, me.as_deref());
+            let (room, cache, redacted, me, root) =
+                (&room, &room_cache, &redacted, me.as_deref(), &root);
             let event_id = m.event_id.clone();
             async move {
                 let Ok(id) = matrix_sdk::ruma::OwnedEventId::try_from(event_id.as_str()) else {
@@ -1636,7 +1663,11 @@ impl Core {
                 };
                 let (reactions, edit) = cached_relations(cache, &id).await;
                 let reactions = aggregate_reactions(room, reactions, me, redacted).await;
-                (reactions, edit, read_by(room, &event_id, me).await)
+                (
+                    reactions,
+                    edit,
+                    read_by(room, &event_id, me, Some(root)).await,
+                )
             }
         }))
         .await;
@@ -1660,7 +1691,7 @@ impl Core {
             {
                 let (reactions, edit) = cached_relations(&room_cache, &root).await;
                 m.reactions = aggregate_reactions(&room, reactions, me.as_deref(), &redacted).await;
-                m.read_by = read_by(&room, &m.event_id, me.as_deref()).await;
+                m.read_by = read_by(&room, &m.event_id, me.as_deref(), None).await;
                 if let Some((_, body, html)) = edit
                     && !m.deleted
                 {
@@ -1669,7 +1700,7 @@ impl Core {
                     m.edited = true;
                 }
                 if let Some(summary) = ev.thread_summary.summary() {
-                    m.thread = Some(thread_info(&room, &room_cache, summary).await);
+                    m.thread = Some(thread_info(&room, &room_cache, &root, summary).await);
                 }
                 out.insert(0, m);
             }
@@ -1849,9 +1880,21 @@ impl Core {
         Ok(resp.response.event_id.to_string())
     }
 
-    async fn mark_read(&self, room_id: &str, event_id: &str) -> Result<()> {
+    async fn mark_read(&self, room_id: &str, event_id: &str, thread: Option<String>) -> Result<()> {
         let room = self.room(room_id).await?;
         let event_id = matrix_sdk::ruma::EventId::parse(event_id).context("invalid event id")?;
+        if let Some(root) = thread.filter(|t| !t.is_empty()) {
+            // A threaded receipt: the room's own marker is untouched.
+            let root = matrix_sdk::ruma::EventId::parse(&root).context("invalid thread root")?;
+            room.send_single_receipt(
+                matrix_sdk::ruma::api::client::receipt::create_receipt::v3::ReceiptType::Read,
+                ReceiptThread::Thread(root),
+                event_id,
+            )
+            .await
+            .context("sending threaded read receipt")?;
+            return Ok(());
+        }
         let receipts = matrix_sdk::room::Receipts::new()
             .fully_read_marker(event_id.clone())
             .public_read_receipt(event_id);
@@ -2048,10 +2091,22 @@ fn is_thread_reply(ev: &TimelineEvent) -> bool {
 async fn thread_info(
     room: &Room,
     cache: &matrix_sdk::event_cache::RoomEventCache,
+    root: &matrix_sdk::ruma::EventId,
     summary: &matrix_sdk::deserialized_responses::ThreadSummary,
 ) -> ThreadInfo {
+    // The thread cache counts replies from others after our threaded receipt.
+    let unread = match room
+        .client()
+        .event_cache()
+        .thread(room.room_id(), root)
+        .await
+    {
+        Ok((thread, _h)) => thread.num_unread_messages().await.unwrap_or(0) as u32,
+        Err(_) => 0,
+    };
     let mut info = ThreadInfo {
         replies: summary.num_replies,
+        unread,
         latest_ts: None,
         latest_sender: None,
         latest_sender_name: None,
@@ -2301,12 +2356,17 @@ async fn read_by(
     room: &Room,
     event_id: &str,
     me: Option<&matrix_sdk::ruma::UserId>,
+    thread_root: Option<&matrix_sdk::ruma::EventId>,
 ) -> Vec<UserRef> {
     let Ok(id) = matrix_sdk::ruma::EventId::parse(event_id) else {
         return Vec::new();
     };
     let mut out: Vec<UserRef> = Vec::new();
-    for thread in [ReceiptThread::Unthreaded, ReceiptThread::Main] {
+    let mut threads = vec![ReceiptThread::Unthreaded, ReceiptThread::Main];
+    if let Some(root) = thread_root {
+        threads.push(ReceiptThread::Thread(root.to_owned()));
+    }
+    for thread in threads {
         let Ok(list) = room
             .load_event_receipts(StoreReceiptType::Read, &thread, &id)
             .await

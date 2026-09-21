@@ -182,6 +182,10 @@ pub enum Command {
     MarkRead {
         room: String,
         event_id: String,
+        /// Mark a thread read up to `event_id` (a threaded receipt) instead
+        /// of the room.
+        #[serde(default)]
+        thread: Option<String>,
     },
     /// Search a server's public room directory (our own homeserver unless
     /// `server` names another).
@@ -536,6 +540,8 @@ pub struct Message {
 #[derive(Debug, Clone, Serialize)]
 pub struct ThreadInfo {
     pub replies: u32,
+    /// Replies from others after our threaded read receipt.
+    pub unread: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub latest_ts: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]

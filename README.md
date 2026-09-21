@@ -126,7 +126,7 @@ the response echoes.
 | `spaces` | | `[{id, name, avatar?, children}]` — joined spaces (excluded from `rooms`) |
 | `search` | `query`, `room?`, `limit` | `{hits: [{room, room_name, event_id, sender, sender_name, body, ts}], server_rooms, scanned_rooms, scanned_messages}` — server search for unencrypted rooms, a bounded local scan of decrypted history for encrypted ones |
 | `preview` | `url` (http/https) | `{url, title?, description?, site?, image?}` — Open Graph data fetched by the homeserver (`image` is an mxc for `avatar`) |
-| `mark_read` | `room`, `event_id` | `{}` — public read receipt and fully-read marker |
+| `mark_read` | `room`, `event_id`, `thread?` (root id: a threaded receipt for that thread instead of the room's marker) | `{}` |
 | `search_rooms` | `query`, `server?`, `limit` | `[{id, name, alias?, topic?, members, joined}]` |
 | `join` | `room` (alias or id) | room info |
 | `search_users` | `query`, `limit` | `[{id, name?}]` |
