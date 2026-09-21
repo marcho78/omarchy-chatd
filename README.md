@@ -1,84 +1,164 @@
 # omarchy-chatd
 
-The daemon behind the [Omarchy chat plugin](https://github.com/marcho78/omarchy-chat).
+The daemon behind [Chat for Omarchy](https://github.com/marcho78/omarchy-chat),
+an end-to-end encrypted Matrix chat that lives in the Omarchy bar.
+
 It owns the Matrix session, the encryption keys and the sync loop, and talks
-to the shell plugin over a local Unix socket. The plugin (QML, inside
-`omarchy-shell`) never sees key material.
+to the shell plugin over a local Unix socket. The plugin — QML running inside
+`omarchy-shell` — never sees key material.
 
 End-to-end encryption is [matrix-rust-sdk](https://github.com/matrix-org/matrix-rust-sdk)
-(Olm/Megolm via vodozemac) — the same stack as Element X. This daemon adds no
-cryptography of its own.
+(Olm/Megolm via [vodozemac](https://github.com/matrix-org/vodozemac)), the
+same stack as Element X. This daemon adds no cryptography of its own.
+
+```
+┌──────────────────────────┐   JSON lines    ┌──────────────────────┐   HTTPS    ┌────────────┐
+│ omarchy-shell            │  over a 0600    │ omarchy-chatd        │  (Matrix   │ homeserver │
+│  └ marcho78.chat (QML)   │◄──────────────►│  matrix-rust-sdk     │◄─────────►│            │
+│    renders, forwards     │  Unix socket    │  keys, store, sync   │  client-   │ sees only  │
+│    what you type         │                 │                      │  server)   │ ciphertext │
+└──────────────────────────┘                 └──────────────────────┘            └────────────┘
+```
 
 ## Install
 
-No binaries are shipped. You build it from this source:
+No binaries are shipped. You build it from this source with `makepkg`:
 
 ```bash
 git clone https://github.com/marcho78/omarchy-chatd && cd omarchy-chatd/packaging && makepkg -si
 ```
 
-`makepkg` pulls `cargo` if needed, compiles the daemon (several minutes the
-first time — matrix-rust-sdk is large), and installs a normal pacman package
-with a systemd user unit. The plugin starts the unit on demand; to run it at
-login instead:
+`makepkg -s` installs `cargo` from the Arch repos if it is missing, builds the
+daemon (several minutes the first time — matrix-rust-sdk is large), and
+`-i` installs the resulting pacman package. The package contains the binary,
+a systemd user unit, this README and the license; it depends only on
+`gcc-libs`, `glibc` and `sqlite`.
+
+The Chat plugin starts the daemon on demand. To run it at login instead:
 
 ```bash
 systemctl --user enable --now omarchy-chatd
 ```
 
-Update: `git pull && cd packaging && makepkg -si`. Remove: `pacman -R omarchy-chatd`.
+| | |
+|---|---|
+| Update | `git pull && cd packaging && makepkg -si` |
+| Remove | `pacman -R omarchy-chatd`, then `rm -rf ~/.local/share/omarchy-chatd` to drop the session and keys |
+| Logs | `journalctl --user -u omarchy-chatd -f` |
 
-## What it stores
+Why not the AUR? It is a distribution channel, not a trust mechanism; the
+`PKGBUILD` here does exactly what an AUR helper would do, minus the lookup. If
+the package appears in the AUR or the Omarchy package repository later, the
+same `PKGBUILD` ships there.
 
-`~/.local/share/omarchy-chatd/` (mode 0700):
+## Security model
 
-* `session.json` (0600) — homeserver, access token, device id and the random
-  passphrase for the encrypted store. Your password is never written.
-* `store-*/` — the SDK's SQLite store: room state, message cache and the
-  encryption keys, encrypted with that passphrase.
+**What the daemon protects:** message content. Everything is encrypted on this
+machine before it reaches the homeserver, which stores and relays ciphertext.
 
-`logout` revokes the token on the server and deletes both.
+**What it does not hide:** metadata. The homeserver knows your account, who
+you talk to, when, and in which rooms. That is inherent to Matrix.
+
+**On disk**, under `~/.local/share/omarchy-chatd/` (mode 0700):
+
+| File | Mode | Contents |
+|---|---|---|
+| `session.json` | 0600 | homeserver, access token, device id, sync token, and the random passphrase for the store |
+| `store-<random>/` | 0700 | the SDK's SQLite store: room state, message cache, Olm/Megolm keys — encrypted with that passphrase |
+
+Your password is used once for `login` and dropped. `logout` revokes the
+token on the server and deletes both entries.
+
+**On the socket** (`$XDG_RUNTIME_DIR/omarchy-chat.sock`):
+
+* created with mode 0600 under a 0077 umask;
+* every connection is checked with `SO_PEERCRED` and refused unless the peer
+  uid is the daemon's own;
+* the password crosses it exactly once, inside the `login` request.
+
+**In the process:** a single daemon per user session; a second instance
+refuses to start while the first answers on the socket. The unit runs with
+`NoNewPrivileges`, `PrivateTmp` and `ProtectSystem=full`.
+
+**Known gaps** (see Roadmap): the store passphrase sits in `session.json`
+instead of the keyring, and this device is not yet cross-signed, so other
+clients show it as unverified.
 
 ## Socket protocol
 
-`$XDG_RUNTIME_DIR/omarchy-chat.sock`, mode 0600, peer uid checked. One JSON
-object per line in each direction.
-
-Requests carry any `id`, which the response echoes:
+One JSON object per line in each direction. Requests carry any `id`, which
+the response echoes.
 
 | `cmd` | fields | result |
 |---|---|---|
 | `status` | | `{version, logged_in, syncing, user_id?, homeserver?, error?}` |
 | `login` | `homeserver`, `username`, `password` | status |
 | `logout` | | status |
-| `rooms` | | `[{id, name, encrypted, direct, unread, highlights}]` |
-| `timeline` | `room`, `limit` (default 50) | `[message]`, oldest first |
+| `rooms` | | `[{id, name, encrypted, direct, unread, highlights}]`, unread first |
+| `timeline` | `room`, `limit` (default 50, max 200) | `[message]`, oldest first |
 | `send` | `room`, `body` | `{event_id}` |
 | `mark_read` | `room`, `event_id` | `{}` |
 
 Responses: `{"id":…, "ok":true, "result":…}` or `{"id":…, "ok":false, "error":"…"}`.
 
-Unsolicited events (the first thing a new connection receives is a `state`):
+A `message` is `{room, event_id, sender, sender_name, body, msgtype, ts, encrypted}`
+— `ts` in milliseconds since the epoch, `encrypted` true when the event
+arrived as `m.room.encrypted` and was decrypted locally.
 
-* `{"event":"state", …status fields}` — on login, logout, sync start/stop, errors
-* `{"event":"message", "room", "event_id", "sender", "sender_name", "body", "msgtype", "ts", "encrypted"}`
+Unsolicited events; the first line on every new connection is a `state`:
+
+| `event` | when | fields |
+|---|---|---|
+| `state` | connect, login, logout, sync start/stop, sync error | the status fields |
+| `message` | a message arrives in a joined room | a message |
+
+Sending into an encrypted room encrypts automatically; the SDK shares the
+room key with every device in the room first. Messages the daemon has no key
+for are skipped in `timeline` (they will be readable once key backup lands).
 
 Try it by hand:
 
 ```bash
-socat - UNIX-CONNECT:$XDG_RUNTIME_DIR/omarchy-chat.sock
-{"id":1,"cmd":"status"}
-{"id":2,"cmd":"login","homeserver":"https://matrix.org","username":"you","password":"…"}
-{"id":3,"cmd":"rooms"}
+scripts/smoke.py                                  # status + rooms
+scripts/smoke.py '{"cmd":"timeline","room":"!abc:matrix.org","limit":5}'
+socat - UNIX-CONNECT:$XDG_RUNTIME_DIR/omarchy-chat.sock   # or interactively
 ```
+
+## Development
+
+```bash
+cargo check                              # fast, catches API drift
+cargo build --release                    # target/release/omarchy-chatd
+target/release/omarchy-chatd --socket /tmp/chat-test.sock --data-dir /tmp/chat-test-data
+scripts/smoke.py --socket /tmp/chat-test.sock
+RUST_LOG=debug,matrix_sdk=info omarchy-chatd   # log filter, default info,matrix_sdk=warn
+```
+
+Layout:
+
+```
+src/main.rs        socket server, peer check, per-connection writer, signals
+src/core.rs        Client lifecycle: session file, login/logout, sync loop, commands
+src/protocol.rs    request / response / event types
+packaging/PKGBUILD builds from a clean checkout of this repo (git+file://)
+omarchy-chatd.service   systemd user unit installed by the package
+```
+
+`packaging/` is separate because makepkg's `$srcdir` is `./src` next to the
+`PKGBUILD` — the Rust source tree. Building there sources the enclosing repo's
+committed `HEAD`, so commit before `makepkg`.
+
+MSRV follows matrix-sdk (currently 1.96). `Cargo.lock` is committed and the
+package builds `--frozen`.
 
 ## Roadmap
 
-1. Device verification (SAS emoji) and key backup — until then, other clients
-   will show this device as unverified and history from before login is not
-   readable.
-2. Read the store passphrase from the Secret Service instead of `session.json`.
-3. Attachments.
+1. **Device verification** — SAS emoji against another device, and recovery
+   key entry. Until then other clients show this device as unverified.
+2. **Key backup** — read history from before this device signed in, and
+   survive a reinstall.
+3. **Keyring** — store passphrase in the Secret Service instead of `session.json`.
+4. Attachments (encrypted uploads), typing, reactions, replies, invites.
 
 ## License
 
