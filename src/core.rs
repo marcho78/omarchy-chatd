@@ -1067,17 +1067,43 @@ impl Core {
         }
         self.set_syncing(true).await;
 
+        // A failed sync (network gone, laptop asleep, server hiccup) must
+        // not end live updates: back off and keep going. Sends still work
+        // meanwhile because they use their own requests; `syncing` tells
+        // the client when we are behind.
         let core = self.clone();
+        let failures = Arc::new(std::sync::atomic::AtomicU32::new(0));
         let result = client
             .sync_with_result_callback(settings, |r| {
                 let core = core.clone();
+                let failures = failures.clone();
                 async move {
-                    let resp = r?;
-                    let _ = core.persist_sync_token(resp.next_batch);
+                    use std::sync::atomic::Ordering;
+                    match r {
+                        Ok(resp) => {
+                            if failures.swap(0, Ordering::Relaxed) > 0 {
+                                info!("sync recovered");
+                                core.set_syncing(true).await;
+                            }
+                            let _ = core.persist_sync_token(resp.next_batch);
+                        }
+                        Err(e) => {
+                            let n = failures.fetch_add(1, Ordering::Relaxed) + 1;
+                            let wait = (2u64 << n.min(5)).min(60);
+                            warn!("sync failed ({n}): {e:#}; retrying in {wait}s");
+                            if n == 1 {
+                                core.set_syncing(false).await;
+                            }
+                            core.set_error(Some(format!("Reconnecting… ({e})"))).await;
+                            tokio::time::sleep(Duration::from_secs(wait)).await;
+                        }
+                    }
                     Ok(LoopCtrl::Continue)
                 }
             })
             .await;
+        // Only reached when the loop is told to stop (never, today) or the
+        // SDK gives up outright.
         warn!("sync loop ended: {result:?}");
         self.set_syncing(false).await;
         if let Err(e) = result {

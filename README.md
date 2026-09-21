@@ -96,6 +96,11 @@ the recovery key once. `verify_request` runs SAS emoji verification against
 another of the user's devices; incoming requests are announced and never
 auto-accepted. `recover` restores the secrets on a new device from the key.
 
+The sync loop keeps going through network loss: a failed sync backs off
+(2 s doubling to 60 s) and retries with the same token; `status` reports
+`syncing: false` and `error: "Reconnecting… (…)"` meanwhile, and clears
+them when a sync succeeds. Sends use their own requests and keep working.
+
 ## Socket protocol
 
 One JSON object per line in each direction. Requests carry any `id`, which
