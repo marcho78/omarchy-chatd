@@ -63,11 +63,21 @@ you talk to, when, and in which rooms. That is inherent to Matrix.
 
 | File | Mode | Contents |
 |---|---|---|
-| `session.json` | 0600 | homeserver, access token, device id, sync token, and the random passphrase for the store |
-| `store-<random>/` | 0700 | the SDK's SQLite store: room state, message cache, Olm/Megolm keys — encrypted with that passphrase |
+| `session.json` | 0600 | homeserver, store path, sync token, and where the secrets are (`"secrets": "keyring"` or `"file"`) |
+| `store-<random>/` | 0700 | the SDK's SQLite store: room state, message cache, Olm/Megolm keys — encrypted with a random passphrase |
+| your keyring | — | one item, *Yapper Matrix session (@you:server)*: the store passphrase and the access/refresh tokens |
+
+The secrets go to the desktop keyring (Secret Service, `org.freedesktop.secrets`
+— gnome-keyring on Omarchy), unlocked with your login session like any other
+app's. With no keyring reachable they stay inline in `session.json` and
+`status` reports `"secrets": "file"`; the daemon tries the keyring again on
+every start and moves them when it can. A session saved before the keyring
+existed is migrated the same way. If the keyring is locked at startup the
+session is retried quietly in the background; `retry_session` asks for the
+unlock prompt and `forget_session` discards a session that cannot be opened.
 
 Your password is used once for `login` and dropped. `logout` revokes the
-token on the server and deletes both entries.
+token on the server and deletes the file, the store and the keyring item.
 
 **On the socket** (`$XDG_RUNTIME_DIR/omarchy-yapper.sock`):
 
@@ -86,9 +96,6 @@ the recovery key once. `verify_request` runs SAS emoji verification against
 another of the user's devices; incoming requests are announced and never
 auto-accepted. `recover` restores the secrets on a new device from the key.
 
-**Known gap** (see Roadmap): the store passphrase sits in `session.json`
-instead of the keyring.
-
 ## Socket protocol
 
 One JSON object per line in each direction. Requests carry any `id`, which
@@ -96,8 +103,10 @@ the response echoes.
 
 | `cmd` | fields | result |
 |---|---|---|
-| `status` | | `{version, logged_in, syncing, user_id?, homeserver?, error?}` |
+| `status` | | `{version, logged_in, syncing, pending_login, user_id?, homeserver?, error?, secrets?, saved_session}` — `secrets` is `keyring` or `file`; `saved_session` means a session exists but is not open yet |
 | `login` | `homeserver`, `username`, `password` | status |
+| `retry_session` | | status — open the saved session again, unlocking the keyring (shows the desktop prompt) |
+| `forget_session` | | status — discard a saved session that cannot be opened, with its store and keyring item |
 | `logout` | | status |
 | `rooms` | | `[{id, name, topic?, encrypted, direct, unread, highlights, notifications, read_marker?}]`, unread first — `unread` is the local count since our receipt, `notifications` the server's |
 | `timeline` | `room`, `limit` (default 50, max 200), `before?` | `{messages, next?}` — oldest first; pass `next` as `before` for the page before; no `next` at the start of history. Served from the SDK's event cache (persisted across restarts): opening a room is a local read, and only history never seen goes to the server |
@@ -216,7 +225,6 @@ package builds `--frozen`.
 1. **Threads** — `m.thread` relations and a thread view.
 2. **Voice messages / calls** — audio attachments and Element Call links.
 3. **Multiple accounts** — one daemon, several sessions.
-4. **Keyring** — store passphrase in the Secret Service instead of `session.json`.
 
 ## License
 

@@ -83,22 +83,36 @@ const SEARCH_TIMEOUT: Duration = Duration::from_secs(20);
 /// Full-text search on a big homeserver can take a while on first use.
 const MESSAGE_SEARCH_TIMEOUT: Duration = Duration::from_secs(45);
 
-/// What survives a restart. Written to `<data_dir>/session.json` with mode
-/// 0600. The store passphrase is random and only ever lives here; the user's
-/// password is never stored.
+/// What survives a restart, written to `<data_dir>/session.json` (mode
+/// 0600). The secrets — the store passphrase and the Matrix tokens — go to
+/// the desktop keyring when there is one ([`crate::secrets`]); `secrets`
+/// says where they are. Files from before the keyring carried them inline,
+/// and are migrated on first load. The user's password is never stored.
 #[derive(Serialize, Deserialize)]
 struct PersistedSession {
     homeserver: String,
     store_path: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    sync_token: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    secrets: Option<crate::secrets::Backend>,
+    // Inline secrets: the file backend, or a pre-keyring file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    store_passphrase: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    auth: Option<StoredAuth>,
+}
+
+/// The secret half of a session: one blob in the keyring.
+#[derive(Clone, Serialize, Deserialize)]
+struct SessionSecrets {
     store_passphrase: String,
     auth: StoredAuth,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    sync_token: Option<String>,
 }
 
 /// The two ways a session can have been obtained. OAuth sessions carry a
 /// refresh token and the client id registered with the homeserver.
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum StoredAuth {
     Password {
@@ -127,6 +141,10 @@ struct State {
     pending: Option<PendingLogin>,
     syncing: bool,
     error: Option<String>,
+    /// Where this session's secrets are kept, once known.
+    secrets_backend: Option<crate::secrets::Backend>,
+    /// The store passphrase, so refreshed tokens can be re-saved beside it.
+    store_passphrase: Option<String>,
 }
 
 impl State {
@@ -177,21 +195,64 @@ impl Core {
         self.data_dir.join("session.json")
     }
 
-    /// Restore a persisted session at startup, if there is one.
+    /// Restore a persisted session at startup, if there is one. A keyring
+    /// that is locked or not answering is retried in the background rather
+    /// than treated as "signed out".
     pub async fn restore(self: &Arc<Self>) -> Result<()> {
-        let file = self.session_file();
-        if !file.exists() {
+        if !self.session_file().exists() {
             return Ok(());
         }
-        let text = tokio::fs::read_to_string(&file).await?;
-        let saved: PersistedSession = serde_json::from_str(&text)?;
+        match self.load_session(true).await {
+            Ok((saved, secrets)) => self.restore_with(saved, secrets).await,
+            Err(e) => {
+                warn!("session not restored yet: {e:#}");
+                self.set_error(Some(format!("Could not read the saved session: {e}")))
+                    .await;
+                // Quiet retries: no unlock prompt until the user asks for one.
+                let core = self.clone();
+                tokio::spawn(async move {
+                    let mut wait = 5u64;
+                    loop {
+                        tokio::time::sleep(Duration::from_secs(wait)).await;
+                        if core.state.lock().await.client.is_some() || !core.session_file().exists()
+                        {
+                            return;
+                        }
+                        match core.load_session(false).await {
+                            Ok((saved, secrets)) => {
+                                if let Err(e) = core.restore_with(saved, secrets).await {
+                                    warn!("restoring the session: {e:#}");
+                                    core.set_error(Some(format!(
+                                        "Could not restore the session: {e}"
+                                    )))
+                                    .await;
+                                }
+                                return;
+                            }
+                            Err(e) => {
+                                warn!("session still not restored: {e:#}");
+                                wait = (wait * 2).min(60);
+                            }
+                        }
+                    }
+                });
+                Ok(())
+            }
+        }
+    }
+
+    async fn restore_with(
+        self: &Arc<Self>,
+        saved: PersistedSession,
+        secrets: SessionSecrets,
+    ) -> Result<()> {
         let client = Client::builder()
             .homeserver_url(&saved.homeserver)
             .handle_refresh_tokens()
-            .sqlite_store(&saved.store_path, Some(&saved.store_passphrase))
+            .sqlite_store(&saved.store_path, Some(&secrets.store_passphrase))
             .build()
             .await?;
-        match saved.auth {
+        match secrets.auth {
             StoredAuth::Password { session } => client.restore_session(session).await?,
             StoredAuth::Oauth { client_id, user } => {
                 client
@@ -199,9 +260,79 @@ impl Core {
                     .await?
             }
         }
-        info!(user = %client.user_id().map(|u| u.to_string()).unwrap_or_default(), "session restored");
+        {
+            let mut st = self.state.lock().await;
+            st.secrets_backend = saved.secrets;
+            st.store_passphrase = Some(secrets.store_passphrase);
+            st.error = None;
+        }
+        info!(
+            user = %client.user_id().map(|u| u.to_string()).unwrap_or_default(),
+            secrets = ?saved.secrets,
+            "session restored"
+        );
         self.start(client, saved.sync_token).await;
         Ok(())
+    }
+
+    /// Read `session.json` and fetch its secrets from wherever they are.
+    /// A file that still carries them inline is moved to the keyring here.
+    async fn load_session(&self, prompt: bool) -> Result<(PersistedSession, SessionSecrets)> {
+        let text = tokio::fs::read_to_string(self.session_file()).await?;
+        let mut saved: PersistedSession =
+            serde_json::from_str(&text).context("reading session.json")?;
+        if let (Some(pass), Some(auth)) = (saved.store_passphrase.take(), saved.auth.take()) {
+            let secrets = SessionSecrets {
+                store_passphrase: pass,
+                auth,
+            };
+            // Inline secrets (a pre-keyring file, or the file fallback):
+            // try the keyring again — it may be available now.
+            saved = self.save_session(saved, &secrets).await?;
+            return Ok((saved, secrets));
+        }
+        match saved.secrets {
+            Some(crate::secrets::Backend::Keyring) => {
+                let blob = crate::secrets::load(&self.data_dir, prompt)
+                    .await?
+                    .ok_or_else(|| anyhow!("the keyring has no entry for this session"))?;
+                let secrets: SessionSecrets =
+                    serde_json::from_slice(&blob).context("reading the keyring entry")?;
+                Ok((saved, secrets))
+            }
+            _ => bail!("session.json has no secrets"),
+        }
+    }
+
+    /// Write the session: secrets to the keyring when it works (the file
+    /// then only points there), else inline in the 0600 file.
+    async fn save_session(
+        &self,
+        mut saved: PersistedSession,
+        secrets: &SessionSecrets,
+    ) -> Result<PersistedSession> {
+        let user = match &secrets.auth {
+            StoredAuth::Password { session } => session.meta.user_id.to_string(),
+            StoredAuth::Oauth { user, .. } => user.meta.user_id.to_string(),
+        };
+        let label = format!("Yapper Matrix session ({user})");
+        let blob = serde_json::to_vec(secrets)?;
+        match crate::secrets::store(&self.data_dir, &label, &blob).await {
+            Ok(()) => {
+                saved.secrets = Some(crate::secrets::Backend::Keyring);
+                saved.store_passphrase = None;
+                saved.auth = None;
+            }
+            Err(e) => {
+                warn!("no keyring for the session secrets ({e:#}); keeping them in session.json");
+                saved.secrets = Some(crate::secrets::Backend::File);
+                saved.store_passphrase = Some(secrets.store_passphrase.clone());
+                saved.auth = Some(secrets.auth.clone());
+            }
+        }
+        write_private(&self.session_file(), &serde_json::to_vec(&saved)?)?;
+        self.state.lock().await.secrets_backend = saved.secrets;
+        Ok(saved)
     }
 
     // ---------- request dispatch ----------
@@ -242,6 +373,20 @@ impl Core {
             }
             Command::LoginCancel => {
                 self.login_cancel().await?;
+                Ok(serde_json::to_value(self.status().await)?)
+            }
+            Command::RetrySession => {
+                self.ensure_signed_out().await?;
+                if !self.session_file().exists() {
+                    bail!("there is no saved session");
+                }
+                let (saved, secrets) = self.load_session(true).await?;
+                self.restore_with(saved, secrets).await?;
+                Ok(serde_json::to_value(self.status().await)?)
+            }
+            Command::ForgetSession => {
+                self.ensure_signed_out().await?;
+                self.forget_session().await;
                 Ok(serde_json::to_value(self.status().await)?)
             }
             Command::Logout => {
@@ -477,7 +622,34 @@ impl Core {
                 .and_then(|c| c.user_id().map(|u| u.to_string())),
             homeserver: st.client.as_ref().map(|c| c.homeserver().to_string()),
             error: st.error.clone(),
+            secrets: st.secrets_backend,
+            saved_session: st.client.is_none() && self.session_file().exists(),
         }
+    }
+
+    /// Drop the saved session and its store without talking to the server:
+    /// for a session that cannot be restored (keyring gone) or after logout.
+    async fn forget_session(&self) {
+        let file = self.session_file();
+        let mut in_keyring = false;
+        if let Ok(text) = std::fs::read_to_string(&file)
+            && let Ok(saved) = serde_json::from_str::<PersistedSession>(&text)
+        {
+            let _ = std::fs::remove_dir_all(&saved.store_path);
+            in_keyring = saved.secrets != Some(crate::secrets::Backend::File);
+        }
+        let _ = std::fs::remove_file(&file);
+        if in_keyring {
+            crate::secrets::forget(&self.data_dir).await;
+        }
+        {
+            let mut st = self.state.lock().await;
+            st.syncing = false;
+            st.error = None;
+            st.secrets_backend = None;
+            st.store_passphrase = None;
+        }
+        self.broadcast_state().await;
     }
 
     async fn broadcast_state(&self) {
@@ -575,11 +747,17 @@ impl Core {
         let saved = PersistedSession {
             homeserver: client.homeserver().to_string(),
             store_path,
+            sync_token: None,
+            secrets: None,
+            store_passphrase: None,
+            auth: None,
+        };
+        let secrets = SessionSecrets {
             store_passphrase,
             auth: StoredAuth::Password { session },
-            sync_token: None,
         };
-        write_private(&self.session_file(), &serde_json::to_vec(&saved)?)?;
+        self.save_session(saved, &secrets).await?;
+        self.state.lock().await.store_passphrase = Some(secrets.store_passphrase);
         info!(user = %username, "logged in with password");
         self.start(client, None).await;
         Ok(())
@@ -640,14 +818,20 @@ impl Core {
                 let saved = PersistedSession {
                     homeserver: client.homeserver().to_string(),
                     store_path: task_store.clone(),
+                    sync_token: None,
+                    secrets: None,
+                    store_passphrase: None,
+                    auth: None,
+                };
+                let secrets = SessionSecrets {
                     store_passphrase: store_passphrase.clone(),
                     auth: StoredAuth::Oauth {
                         client_id: full.client_id,
                         user: full.user,
                     },
-                    sync_token: None,
                 };
-                write_private(&core.session_file(), &serde_json::to_vec(&saved)?)?;
+                core.save_session(saved, &secrets).await?;
+                core.state.lock().await.store_passphrase = Some(secrets.store_passphrase);
                 Ok(())
             }
             .await;
@@ -704,20 +888,8 @@ impl Core {
             // The token may already be dead; local state is wiped regardless.
             warn!("server logout failed: {e:#}");
         }
-        let file = self.session_file();
-        if let Ok(text) = std::fs::read_to_string(&file) {
-            if let Ok(saved) = serde_json::from_str::<PersistedSession>(&text) {
-                let _ = std::fs::remove_dir_all(&saved.store_path);
-            }
-        }
-        let _ = std::fs::remove_file(&file);
-        {
-            let mut st = self.state.lock().await;
-            st.syncing = false;
-            st.error = None;
-        }
+        self.forget_session().await;
         info!("logged out; local store wiped");
-        self.broadcast_state().await;
         Ok(())
     }
 
@@ -754,7 +926,7 @@ impl Core {
             while let Ok(change) = changes.recv().await {
                 match change {
                     SessionChange::TokensRefreshed => {
-                        if let Err(e) = core.persist_tokens(&watch_client) {
+                        if let Err(e) = core.persist_tokens(&watch_client).await {
                             warn!("could not persist refreshed tokens: {e:#}");
                         }
                     }
@@ -814,26 +986,35 @@ impl Core {
         self.broadcast_state().await;
     }
 
-    fn persist_tokens(&self, client: &Client) -> Result<()> {
-        let file = self.session_file();
-        let text = std::fs::read_to_string(&file)?;
-        let mut saved: PersistedSession = serde_json::from_str(&text)?;
-        saved.auth = match saved.auth {
-            StoredAuth::Password { .. } => StoredAuth::Password {
+    async fn persist_tokens(&self, client: &Client) -> Result<()> {
+        let text = std::fs::read_to_string(self.session_file())?;
+        let saved: PersistedSession = serde_json::from_str(&text)?;
+        let store_passphrase = self
+            .state
+            .lock()
+            .await
+            .store_passphrase
+            .clone()
+            .ok_or_else(|| anyhow!("no store passphrase in memory"))?;
+        // The client knows which kind of session it holds.
+        let auth = match client.oauth().full_session() {
+            Some(full) => StoredAuth::Oauth {
+                client_id: full.client_id,
+                user: full.user,
+            },
+            None => StoredAuth::Password {
                 session: client
                     .matrix_auth()
                     .session()
                     .ok_or_else(|| anyhow!("no session"))?,
             },
-            StoredAuth::Oauth { client_id, .. } => StoredAuth::Oauth {
-                client_id,
-                user: client
-                    .oauth()
-                    .user_session()
-                    .ok_or_else(|| anyhow!("no session"))?,
-            },
         };
-        write_private(&file, &serde_json::to_vec(&saved)?)
+        let secrets = SessionSecrets {
+            store_passphrase,
+            auth,
+        };
+        self.save_session(saved, &secrets).await?;
+        Ok(())
     }
 
     async fn sync_loop(self: Arc<Self>, client: Client, initial_token: Option<String>) {
@@ -881,6 +1062,7 @@ impl Core {
         }
     }
 
+    /// The sync token is not secret and changes every sync: file only.
     fn persist_sync_token(&self, token: String) -> Result<()> {
         let file = self.session_file();
         let text = std::fs::read_to_string(&file)?;

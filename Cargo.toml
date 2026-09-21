@@ -22,6 +22,7 @@ mime2ext = "0.1"
 mime_guess = "2"
 # Default features: e2e-encryption, automatic-room-key-forwarding, sqlite, rustls.
 # local-server: loopback HTTP listener for the OAuth redirect.
+oo7 = { version = "0.6", default-features = false, features = ["tokio", "native_crypto"] }
 matrix-sdk = { version = "0.19", features = ["local-server", "markdown"] }
 matrix-sdk-base = "0.19"
 rand = "0.10"

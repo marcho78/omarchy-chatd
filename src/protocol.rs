@@ -36,6 +36,10 @@ pub enum Command {
     },
     /// Abandon a browser sign-in that has not completed.
     LoginCancel,
+    /// Restore the saved session again, unlocking the keyring if it asks.
+    RetrySession,
+    /// Discard a saved session that cannot be restored (and its store).
+    ForgetSession,
     /// Invalidate the access token and wipe the local store.
     Logout,
     /// Joined rooms with names, encryption flag and unread counts.
@@ -421,6 +425,11 @@ pub struct Status {
     pub homeserver: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Where the session's secrets are kept: `keyring` or `file`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub secrets: Option<crate::secrets::Backend>,
+    /// A session is saved but not restored (keyring locked or unreachable).
+    pub saved_session: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
