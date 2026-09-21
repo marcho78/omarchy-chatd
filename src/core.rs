@@ -250,6 +250,14 @@ impl Core {
                 let key = self.reset_recovery_key().await?;
                 Ok(json!({ "recovery_key": key }))
             }
+            Command::Download { room, event_id, thumbnail } => {
+                let (path, mime) = self.download(&room, &event_id, thumbnail).await?;
+                Ok(json!({ "path": path, "mime": mime }))
+            }
+            Command::SendFile { room, path, caption } => {
+                let event_id = self.send_file(&room, &path, caption).await?;
+                Ok(json!({ "event_id": event_id }))
+            }
             Command::AcceptInvite { room } => {
                 let room = self.room(&room).await?;
                 room.join().await.context("accepting invite")?;
@@ -286,7 +294,7 @@ impl Core {
         self.state.lock().await.client.clone().ok_or_else(|| anyhow!("not logged in"))
     }
 
-    async fn room(&self, id: &str) -> Result<Room> {
+    pub(crate) async fn room(&self, id: &str) -> Result<Room> {
         let id: OwnedRoomId = RoomId::parse(id).context("invalid room id")?;
         self.client().await?.get_room(&id).ok_or_else(|| anyhow!("unknown room {id}"))
     }
@@ -773,6 +781,7 @@ impl Core {
                         msgtype: "unable_to_decrypt".to_owned(),
                         ts: enc.origin_server_ts.0.into(),
                         encrypted: true,
+                        attachment: None,
                     });
                 }
                 _ => {}
@@ -896,6 +905,7 @@ async fn to_message(room: &Room, ev: OriginalSyncRoomMessageEvent, encrypted: bo
         msgtype: ev.content.msgtype.msgtype().to_owned(),
         ts: ev.origin_server_ts.0.into(),
         encrypted,
+        attachment: crate::media::attachment_of(&ev.content.msgtype),
     }
 }
 

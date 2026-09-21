@@ -6,6 +6,7 @@
 //! connection is checked against our own uid via SO_PEERCRED.
 
 mod core;
+mod media;
 mod protocol;
 mod verify;
 

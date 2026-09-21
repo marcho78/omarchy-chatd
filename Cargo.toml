@@ -15,7 +15,11 @@ path = "src/main.rs"
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 futures-util = { version = "0.3", default-features = false }
+imagesize = "0.13"
 libc = "0.2"
+mime = "0.3"
+mime2ext = "0.1"
+mime_guess = "2"
 # Default features: e2e-encryption, automatic-room-key-forwarding, sqlite, rustls.
 # local-server: loopback HTTP listener for the OAuth redirect.
 matrix-sdk = { version = "0.19", features = ["local-server"] }

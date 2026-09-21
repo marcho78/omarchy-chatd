@@ -116,10 +116,14 @@ the response echoes.
 | `recover` | `key` | verification status |
 | `setup_recovery` | | `{recovery_key}` — first device: cross-signing, secret storage, backup |
 | `reset_recovery_key` | | `{recovery_key}` — the old key stops working |
+| `download` | `room`, `event_id`, `thumbnail?` | `{path, mime}` — decrypted into `~/.cache/omarchy-yapper/media/` (0600) |
+| `send_file` | `room`, `path`, `caption?` | `{event_id}` — encrypted in encrypted rooms; images carry their dimensions |
 
 Responses: `{"id":…, "ok":true, "result":…}` or `{"id":…, "ok":false, "error":"…"}`.
 
-A `message` is `{room, event_id, sender, sender_name, body, html?, msgtype, ts, encrypted}`
+A `message` is `{room, event_id, sender, sender_name, body, html?, msgtype, ts, encrypted, attachment?}`
+— `attachment` is `{kind, name, mime?, size?, width?, height?, has_thumbnail}` for
+`m.image`, `m.file`, `m.video` and `m.audio`
 — `ts` in milliseconds since the epoch, `encrypted` true when the event
 arrived as `m.room.encrypted` and was decrypted locally, `html` the sender's
 formatted body when there is one.
@@ -183,8 +187,7 @@ package builds `--frozen`.
 
 ## Roadmap
 
-1. Attachments (encrypted uploads and downloads).
-2. Scrollback, read markers, replies, edits.
+1. Scrollback, read markers, replies, edits.
 3. **Keyring** — store passphrase in the Secret Service instead of `session.json`.
 
 ## License

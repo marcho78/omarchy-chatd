@@ -99,6 +99,21 @@ pub enum Command {
     /// Replace the recovery key with a new one (the old one stops working).
     /// Returns the new key, shown once.
     ResetRecoveryKey,
+    /// Fetch (and decrypt) an attachment or its thumbnail into the media
+    /// cache. Returns `{path, mime}`.
+    Download {
+        room: String,
+        event_id: String,
+        #[serde(default)]
+        thumbnail: bool,
+    },
+    /// Upload a local file as an attachment (encrypted in encrypted rooms).
+    SendFile {
+        room: String,
+        path: String,
+        #[serde(default)]
+        caption: Option<String>,
+    },
     AcceptInvite { room: String },
     DeclineInvite { room: String },
     Leave { room: String },
@@ -272,4 +287,23 @@ pub struct Message {
     pub ts: u64,
     /// True when this message arrived encrypted and was decrypted locally.
     pub encrypted: bool,
+    /// Present for m.image / m.file / m.video / m.audio.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attachment: Option<Attachment>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct Attachment {
+    /// image | file | video | audio
+    pub kind: String,
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mime: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub width: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub height: Option<u64>,
+    pub has_thumbnail: bool,
 }
