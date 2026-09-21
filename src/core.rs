@@ -31,17 +31,21 @@ use matrix_sdk::{
         api::client::{
             directory::get_public_rooms_filtered,
             filter::FilterDefinition,
-            receipt::create_receipt::v3::ReceiptType,
             room::{Visibility, create_room},
         },
+        events::receipt::ReceiptType as StoreReceiptType,
         directory::Filter,
         events::{
             AnySyncMessageLikeEvent, AnySyncTimelineEvent, EmptyStateKey, InitialStateEvent, SyncMessageLikeEvent,
             receipt::ReceiptThread,
+            relation::Replacement,
             room::{
                 encryption::RoomEncryptionEventContent,
                 member::{MembershipState, OriginalSyncRoomMemberEvent, StrippedRoomMemberEvent},
-                message::{MessageFormat, MessageType, OriginalSyncRoomMessageEvent, RoomMessageEventContent},
+                message::{
+                    AddMentions, MessageFormat, MessageType, OriginalSyncRoomMessageEvent, Relation,
+                    RoomMessageEventContent, RoomMessageEventContentWithoutRelation,
+                },
             },
         },
         serde::Raw,
@@ -56,8 +60,8 @@ use tracing::{info, warn};
 use url::Url;
 
 use crate::protocol::{
-    Command, DirectoryRoom, DirectoryUser, Event, InviteInfo, Message, Request, Response, RoomInfo, Status,
-    TimelinePage,
+    Command, DirectoryRoom, DirectoryUser, Event, InviteInfo, Message, MessageEdit, ReplyPreview, Request,
+    Response, RoomInfo, Status, TimelinePage,
 };
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -204,9 +208,13 @@ impl Core {
             Command::Timeline { room, limit, before } => {
                 Ok(serde_json::to_value(self.timeline(&room, limit, before).await?)?)
             }
-            Command::Send { room, body } => {
-                let event_id = self.send(&room, body).await?;
+            Command::Send { room, body, reply_to } => {
+                let event_id = self.send(&room, body, reply_to).await?;
                 Ok(json!({ "event_id": event_id }))
+            }
+            Command::Edit { room, event_id, body } => {
+                let id = self.edit(&room, &event_id, body).await?;
+                Ok(json!({ "event_id": id }))
             }
             Command::MarkRead { room, event_id } => {
                 self.mark_read(&room, &event_id).await?;
@@ -529,6 +537,33 @@ impl Core {
             }
         });
 
+        // Receipts (ours from another device, theirs), unread flags and new
+        // latest events all change what the room list shows; coalesce them.
+        let core = self.clone();
+        let mut updates = client.room_info_notable_update_receiver();
+        tokio::spawn(async move {
+            use matrix_sdk_base::RoomInfoNotableUpdateReasons as R;
+            let mut pending = false;
+            loop {
+                let wait = if pending { Duration::from_millis(300) } else { Duration::from_secs(3600) };
+                match tokio::time::timeout(wait, updates.recv()).await {
+                    Ok(Ok(u)) => {
+                        if u.reasons.intersects(R::READ_RECEIPT | R::UNREAD_MARKER | R::LATEST_EVENT) {
+                            pending = true;
+                        }
+                    }
+                    Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => pending = true,
+                    Ok(Err(_)) => break,
+                    Err(_) => {
+                        if pending {
+                            pending = false;
+                            let _ = core.events().send(Event::RoomsChanged);
+                        }
+                    }
+                }
+            }
+        });
+
         let mut st = self.state.lock().await;
         st.client = Some(client);
         st.sync_task = Some(task);
@@ -646,14 +681,25 @@ impl Core {
             .map(|s| s.is_encrypted())
             .unwrap_or(false);
         let counts = room.unread_notification_counts();
+        let read_marker = match room.client().user_id() {
+            Some(me) => room
+                .load_user_receipt(StoreReceiptType::Read, &ReceiptThread::Unthreaded, me)
+                .await
+                .ok()
+                .flatten()
+                .map(|(eid, _)| eid.to_string()),
+            None => None,
+        };
         RoomInfo {
             id: room.room_id().to_string(),
             name,
             topic: room.topic(),
             encrypted,
             direct: room.is_direct().await.unwrap_or(false),
-            unread: counts.notification_count,
-            highlights: counts.highlight_count,
+            unread: room.num_unread_messages(),
+            highlights: room.num_unread_mentions().max(counts.highlight_count),
+            notifications: counts.notification_count,
+            read_marker,
         }
     }
 
@@ -787,7 +833,20 @@ impl Core {
         match parsed {
             AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::RoomMessage(
                 SyncMessageLikeEvent::Original(msg),
-            )) => Some(to_message(room, msg, encrypted).await),
+            )) => {
+                // An edit event itself is not shown; its target carries it.
+                if matches!(msg.content.relates_to, Some(Relation::Replacement(_))) {
+                    return None;
+                }
+                let mut m = to_message(room, msg, encrypted).await;
+                // The server bundles the latest edit under unsigned.m.relations.
+                if let Some((body, html)) = bundled_edit(ev.raw()) {
+                    m.body = body;
+                    m.html = html;
+                    m.edited = true;
+                }
+                Some(m)
+            }
             // Still encrypted: we have no key (yet). Show a placeholder so
             // the gap is visible; backup or key sharing may fill it later.
             AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::RoomEncrypted(
@@ -808,24 +867,55 @@ impl Core {
                     ts: enc.origin_server_ts.0.into(),
                     encrypted: true,
                     attachment: None,
+                    reply_to: None,
+                    edited: false,
                 })
             }
             _ => None,
         }
     }
 
-    async fn send(&self, room_id: &str, body: String) -> Result<String> {
+    async fn send(&self, room_id: &str, body: String, reply_to: Option<String>) -> Result<String> {
         let room = self.room(room_id).await?;
-        let resp = room.send(RoomMessageEventContent::text_plain(body)).await.context("sending")?;
+        let content = match reply_to.filter(|r| !r.is_empty()) {
+            Some(target) => {
+                let target = matrix_sdk::ruma::EventId::parse(&target).context("invalid reply target")?;
+                let reply = matrix_sdk::room::reply::Reply {
+                    event_id: target,
+                    enforce_thread: matrix_sdk::room::reply::EnforceThread::MaybeThreaded,
+                    add_mentions: AddMentions::Yes,
+                };
+                room.make_reply_event(RoomMessageEventContentWithoutRelation::text_plain(body), reply)
+                    .await
+                    .context("building the reply")?
+            }
+            None => RoomMessageEventContent::text_plain(body),
+        };
+        let resp = room.send(content).await.context("sending")?;
+        Ok(resp.response.event_id.to_string())
+    }
+
+    async fn edit(&self, room_id: &str, event_id: &str, body: String) -> Result<String> {
+        let room = self.room(room_id).await?;
+        let target = matrix_sdk::ruma::EventId::parse(event_id).context("invalid event id")?;
+        let content = room
+            .make_edit_event(
+                &target,
+                matrix_sdk::room::edit::EditedContent::RoomMessage(RoomMessageEventContentWithoutRelation::text_plain(body)),
+            )
+            .await
+            .context("building the edit")?;
+        let resp = room.send(content).await.context("sending the edit")?;
         Ok(resp.response.event_id.to_string())
     }
 
     async fn mark_read(&self, room_id: &str, event_id: &str) -> Result<()> {
         let room = self.room(room_id).await?;
         let event_id = matrix_sdk::ruma::EventId::parse(event_id).context("invalid event id")?;
-        room.send_single_receipt(ReceiptType::Read, ReceiptThread::Unthreaded, event_id)
-            .await
-            .context("sending read receipt")?;
+        let receipts = matrix_sdk::room::Receipts::new()
+            .fully_read_marker(event_id.clone())
+            .public_read_receipt(event_id);
+        room.send_multiple_receipts(receipts).await.context("sending read receipt")?;
         Ok(())
     }
 }
@@ -861,8 +951,58 @@ async fn on_room_message(
     if room.state() != RoomState::Joined {
         return;
     }
+    if let Some(Relation::Replacement(Replacement { event_id, new_content, .. })) = &event.content.relates_to {
+        let html = formatted_html(&new_content.msgtype);
+        let _ = ctx.events.send(Event::MessageEdited(MessageEdit {
+            room: room.room_id().to_string(),
+            event_id: event_id.to_string(),
+            body: new_content.msgtype.body().to_owned(),
+            html,
+        }));
+        return;
+    }
     let msg = to_message(&room, event, encryption.is_some()).await;
     let _ = ctx.events.send(Event::Message(msg));
+}
+
+fn formatted_html(msgtype: &MessageType) -> Option<String> {
+    match msgtype {
+        MessageType::Text(t) => t.formatted.as_ref(),
+        MessageType::Notice(n) => n.formatted.as_ref(),
+        MessageType::Emote(e) => e.formatted.as_ref(),
+        _ => None,
+    }
+    .filter(|f| f.format == MessageFormat::Html)
+    .map(|f| f.body.clone())
+}
+
+/// The newest edit the server attached to an event, if any.
+fn bundled_edit(raw: &matrix_sdk::ruma::serde::Raw<AnySyncTimelineEvent>) -> Option<(String, Option<String>)> {
+    let unsigned: serde_json::Value = raw.get_field("unsigned").ok().flatten()?;
+    let replace = unsigned.get("m.relations")?.get("m.replace")?;
+    let new_content = replace.get("content")?.get("m.new_content")?;
+    let body = new_content.get("body")?.as_str()?.to_owned();
+    let html = match (new_content.get("format").and_then(|f| f.as_str()), new_content.get("formatted_body").and_then(|b| b.as_str())) {
+        (Some("org.matrix.custom.html"), Some(h)) => Some(h.to_owned()),
+        _ => None,
+    };
+    Some((body, html))
+}
+
+/// Matrix used to put a quoted fallback of the replied-to message at the top
+/// of a reply's body; strip it so the quote is rendered once, properly.
+fn strip_reply_fallback(body: &str) -> String {
+    if !body.starts_with("> ") {
+        return body.to_owned();
+    }
+    let mut lines = body.lines();
+    for line in lines.by_ref() {
+        if line.is_empty() {
+            break;
+        }
+    }
+    let rest: Vec<&str> = lines.collect();
+    if rest.is_empty() { body.to_owned() } else { rest.join("\n") }
 }
 
 /// Invites arrive as stripped state; announce the ones addressed to us.
@@ -910,26 +1050,54 @@ async fn to_message(room: &Room, ev: OriginalSyncRoomMessageEvent, encrypted: bo
         Ok(Some(m)) => m.name().to_owned(),
         _ => ev.sender.localpart().to_owned(),
     };
-    let html = match &ev.content.msgtype {
-        MessageType::Text(t) => t.formatted.as_ref(),
-        MessageType::Notice(n) => n.formatted.as_ref(),
-        MessageType::Emote(e) => e.formatted.as_ref(),
+    let html = formatted_html(&ev.content.msgtype);
+    let reply_to = match &ev.content.relates_to {
+        Some(Relation::Reply(in_reply_to)) => reply_preview(room, &in_reply_to.in_reply_to.event_id).await,
         _ => None,
-    }
-    .filter(|f| f.format == MessageFormat::Html)
-    .map(|f| f.body.clone());
+    };
+    let body = if reply_to.is_some() { strip_reply_fallback(ev.content.body()) } else { ev.content.body().to_owned() };
+    // The HTML fallback carries the quote in <mx-reply>, which the client strips.
     Message {
         room: room.room_id().to_string(),
         event_id: ev.event_id.to_string(),
         sender: ev.sender.to_string(),
         sender_name,
-        body: ev.content.body().to_owned(),
+        body,
         html,
         msgtype: ev.content.msgtype.msgtype().to_owned(),
         ts: ev.origin_server_ts.0.into(),
         encrypted,
         attachment: crate::media::attachment_of(&ev.content.msgtype),
+        reply_to,
+        edited: false,
     }
+}
+
+/// A one-line preview of the message a reply points at.
+async fn reply_preview(room: &Room, event_id: &matrix_sdk::ruma::EventId) -> Option<ReplyPreview> {
+    let ev = room.event(event_id, None).await.ok()?;
+    let parsed: AnySyncTimelineEvent = ev.raw().deserialize().ok()?;
+    let edited = bundled_edit(ev.raw()).map(|(b, _)| b);
+    let (sender, body) = match parsed {
+        AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::RoomMessage(SyncMessageLikeEvent::Original(m))) => {
+            let text = match crate::media::attachment_of(&m.content.msgtype) {
+                Some(a) => format!("{} {}", match a.kind.as_str() { "image" => "🖼", "video" => "🎞", "audio" => "🎵", _ => "📎" }, a.caption.unwrap_or(a.name)),
+                None => edited.unwrap_or_else(|| strip_reply_fallback(m.content.body())),
+            };
+            (m.sender, text)
+        }
+        AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::RoomEncrypted(SyncMessageLikeEvent::Original(e))) => {
+            (e.sender, "Unable to decrypt".to_owned())
+        }
+        _ => return None,
+    };
+    let sender_name = match room.get_member_no_sync(&sender).await {
+        Ok(Some(m)) => m.name().to_owned(),
+        _ => sender.localpart().to_owned(),
+    };
+    let one_line: String = body.split_whitespace().collect::<Vec<_>>().join(" ");
+    let body = if one_line.chars().count() > 160 { format!("{}…", one_line.chars().take(160).collect::<String>()) } else { one_line };
+    Some(ReplyPreview { event_id: event_id.to_string(), sender: sender.to_string(), sender_name, body })
 }
 
 /// Write a file readable only by this user, replacing any previous content.

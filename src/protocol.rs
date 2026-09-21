@@ -48,9 +48,18 @@ pub enum Command {
         #[serde(default)]
         before: Option<String>,
     },
-    /// Send a plain-text message. Encrypted automatically in encrypted rooms.
-    Send { room: String, body: String },
-    /// Send a read receipt up to the given event.
+    /// Send a plain-text message, optionally as a reply. Encrypted
+    /// automatically in encrypted rooms.
+    Send {
+        room: String,
+        body: String,
+        #[serde(default)]
+        reply_to: Option<String>,
+    },
+    /// Replace the text of one of our own messages.
+    Edit { room: String, event_id: String, body: String },
+    /// Mark the room read up to the given event: public read receipt plus
+    /// the fully-read marker, so every client and device agrees.
     MarkRead { room: String, event_id: String },
     /// Search a server's public room directory (our own homeserver unless
     /// `server` names another).
@@ -166,6 +175,8 @@ pub enum Event {
     /// Our own membership changed somewhere (joined, left, kicked): the
     /// room list should be fetched again.
     RoomsChanged,
+    /// One of the messages in a room was edited; replace its text.
+    MessageEdited(MessageEdit),
     /// A verification flow changed state.
     Verification(VerificationInfo),
     /// Cross-signing or backup state changed; fetch verification_status.
@@ -271,8 +282,15 @@ pub struct RoomInfo {
     pub topic: Option<String>,
     pub encrypted: bool,
     pub direct: bool,
+    /// Messages after our read receipt, as counted locally: drops as you read.
     pub unread: u64,
+    /// Mentions / keyword hits among those.
     pub highlights: u64,
+    /// What the server would push about (its notification count).
+    pub notifications: u64,
+    /// Our read receipt / fully-read marker, if we have one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub read_marker: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -302,6 +320,30 @@ pub struct Message {
     /// Present for m.image / m.file / m.video / m.audio.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub attachment: Option<Attachment>,
+    /// The message this one replies to.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reply_to: Option<ReplyPreview>,
+    /// True when the body shown is a later edit of the original.
+    pub edited: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ReplyPreview {
+    pub event_id: String,
+    pub sender: String,
+    pub sender_name: String,
+    /// One line of the original, trimmed.
+    pub body: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MessageEdit {
+    pub room: String,
+    /// The message that was edited.
+    pub event_id: String,
+    pub body: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub html: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]

@@ -2335,6 +2335,7 @@ dependencies = [
  "imagesize",
  "libc",
  "matrix-sdk",
+ "matrix-sdk-base",
  "mime",
  "mime2ext",
  "mime_guess",

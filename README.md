@@ -99,10 +99,11 @@ the response echoes.
 | `status` | | `{version, logged_in, syncing, user_id?, homeserver?, error?}` |
 | `login` | `homeserver`, `username`, `password` | status |
 | `logout` | | status |
-| `rooms` | | `[{id, name, encrypted, direct, unread, highlights}]`, unread first |
+| `rooms` | | `[{id, name, topic?, encrypted, direct, unread, highlights, notifications, read_marker?}]`, unread first — `unread` is the local count since our receipt, `notifications` the server's |
 | `timeline` | `room`, `limit` (default 50, max 200), `before?` | `{messages, next?}` — oldest first; pass `next` as `before` for the page before; no `next` at the start of history |
-| `send` | `room`, `body` | `{event_id}` |
-| `mark_read` | `room`, `event_id` | `{}` |
+| `send` | `room`, `body`, `reply_to?` | `{event_id}` |
+| `edit` | `room`, `event_id`, `body` | `{event_id}` — replaces one of our messages |
+| `mark_read` | `room`, `event_id` | `{}` — public read receipt and fully-read marker |
 | `search_rooms` | `query`, `server?`, `limit` | `[{id, name, alias?, topic?, members, joined}]` |
 | `join` | `room` (alias or id) | room info |
 | `search_users` | `query`, `limit` | `[{id, name?}]` |
@@ -121,7 +122,8 @@ the response echoes.
 
 Responses: `{"id":…, "ok":true, "result":…}` or `{"id":…, "ok":false, "error":"…"}`.
 
-A `message` is `{room, event_id, sender, sender_name, body, html?, msgtype, ts, encrypted, attachment?}`
+A `message` is `{room, event_id, sender, sender_name, body, html?, msgtype, ts, encrypted, attachment?, reply_to?, edited}`
+— `reply_to` is `{event_id, sender, sender_name, body}`; an edited message carries its latest text
 — `attachment` is `{kind, name, caption?, mime?, size?, width?, height?, has_thumbnail}` for
 `m.image`, `m.file`, `m.video` and `m.audio`
 — `ts` in milliseconds since the epoch, `encrypted` true when the event
@@ -135,7 +137,8 @@ Unsolicited events; the first line on every new connection is a `state`:
 | `state` | connect, login, logout, sync start/stop, sync error | the status fields |
 | `message` | a message arrives in a joined room | a message |
 | `invite` | we were invited | `{room, name, inviter?, inviter_name?, direct}` |
-| `rooms_changed` | our own membership changed | |
+| `rooms_changed` | our membership, a receipt, an unread flag or a latest event changed | |
+| `message_edited` | one of a room's messages was edited | `{room, event_id, body, html?}` |
 | `verification` | a verification flow moved | `{flow_id, other_user, other_device?, outgoing, state, emojis?, reason?}` — state is requested, ready, emoji, confirmed, done or cancelled |
 | `verification_status_changed` | identity, backup or recovery changed | |
 
@@ -187,7 +190,7 @@ package builds `--frozen`.
 
 ## Roadmap
 
-1. Read markers, replies, edits.
+1. Reactions, typing, receipts (Tier 2).
 3. **Keyring** — store passphrase in the Secret Service instead of `session.json`.
 
 ## License
