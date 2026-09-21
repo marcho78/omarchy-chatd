@@ -58,6 +58,14 @@ pub enum Command {
     },
     /// Replace the text of one of our own messages.
     Edit { room: String, event_id: String, body: String },
+    /// Remove one of our own messages (a redaction).
+    Delete { room: String, event_id: String },
+    /// Add an emoji reaction to a message.
+    React { room: String, event_id: String, key: String },
+    /// Remove our reaction (its own event id, from the aggregate).
+    Unreact { room: String, reaction_id: String },
+    /// Tell the room we are typing (or stopped).
+    Typing { room: String, typing: bool },
     /// Mark the room read up to the given event: public read receipt plus
     /// the fully-read marker, so every client and device agrees.
     MarkRead { room: String, event_id: String },
@@ -177,6 +185,14 @@ pub enum Event {
     RoomsChanged,
     /// One of the messages in a room was edited; replace its text.
     MessageEdited(MessageEdit),
+    /// Someone reacted to a message.
+    Reaction(ReactionEvent),
+    /// A message or reaction was removed.
+    Redacted(Redaction),
+    /// Who is typing in a room right now (empty when nobody).
+    Typing(TypingInfo),
+    /// Read receipts from others moved.
+    Receipt(ReceiptInfo),
     /// A verification flow changed state.
     Verification(VerificationInfo),
     /// Cross-signing or backup state changed; fetch verification_status.
@@ -325,6 +341,70 @@ pub struct Message {
     pub reply_to: Option<ReplyPreview>,
     /// True when the body shown is a later edit of the original.
     pub edited: bool,
+    /// Emoji reactions, aggregated.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub reactions: Vec<Reaction>,
+    /// Others whose read receipt points at this message.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub read_by: Vec<UserRef>,
+    /// True when the message was deleted (redacted).
+    pub deleted: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct Reaction {
+    pub key: String,
+    pub count: u32,
+    pub senders: Vec<ReactionSender>,
+    /// Our own reaction's event id, so it can be removed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mine: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ReactionSender {
+    pub id: String,
+    pub name: String,
+    /// That user's reaction event, so a redaction of it can be matched.
+    pub reaction_id: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct UserRef {
+    pub id: String,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ReactionEvent {
+    pub room: String,
+    /// The message reacted to.
+    pub event_id: String,
+    pub key: String,
+    pub sender: UserRef,
+    /// The reaction event itself (needed to remove it).
+    pub reaction_id: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct Redaction {
+    pub room: String,
+    /// The event that was removed: a message or a reaction.
+    pub event_id: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TypingInfo {
+    pub room: String,
+    pub users: Vec<UserRef>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ReceiptInfo {
+    pub room: String,
+    /// Users whose read receipt moved, and the event it now points at.
+    pub event_id: String,
+    pub users: Vec<UserRef>,
 }
 
 #[derive(Debug, Clone, Serialize)]

@@ -1,3 +1,4 @@
+#![recursion_limit = "512"]
 //! omarchy-yapperd: a per-user daemon that owns the Matrix session, keys and
 //! sync loop, and exposes them over a Unix socket so the Omarchy shell plugin
 //! (QML) never handles key material.

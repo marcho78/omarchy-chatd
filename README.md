@@ -103,6 +103,9 @@ the response echoes.
 | `timeline` | `room`, `limit` (default 50, max 200), `before?` | `{messages, next?}` — oldest first; pass `next` as `before` for the page before; no `next` at the start of history |
 | `send` | `room`, `body`, `reply_to?` | `{event_id}` |
 | `edit` | `room`, `event_id`, `body` | `{event_id}` — replaces one of our messages |
+| `delete` | `room`, `event_id` | `{}` — redacts one of our messages |
+| `react` / `unreact` | `room`, `event_id`, `key` / `room`, `reaction_id` | `{reaction_id}` / `{}` |
+| `typing` | `room`, `typing` | `{}` |
 | `mark_read` | `room`, `event_id` | `{}` — public read receipt and fully-read marker |
 | `search_rooms` | `query`, `server?`, `limit` | `[{id, name, alias?, topic?, members, joined}]` |
 | `join` | `room` (alias or id) | room info |
@@ -122,8 +125,10 @@ the response echoes.
 
 Responses: `{"id":…, "ok":true, "result":…}` or `{"id":…, "ok":false, "error":"…"}`.
 
-A `message` is `{room, event_id, sender, sender_name, body, html?, msgtype, ts, encrypted, attachment?, reply_to?, edited}`
-— `reply_to` is `{event_id, sender, sender_name, body}`; an edited message carries its latest text
+A `message` is `{room, event_id, sender, sender_name, body, html?, msgtype, ts, encrypted, attachment?, reply_to?, edited, reactions, read_by, deleted}`
+— `reply_to` is `{event_id, sender, sender_name, body}`; an edited message carries its latest
+text; `reactions` is `[{key, count, senders: [{id, name, reaction_id}], mine?}]`; `read_by`
+lists others whose read receipt points here; a deleted message keeps its place with `deleted: true`
 — `attachment` is `{kind, name, caption?, mime?, size?, width?, height?, has_thumbnail}` for
 `m.image`, `m.file`, `m.video` and `m.audio`
 — `ts` in milliseconds since the epoch, `encrypted` true when the event
@@ -139,6 +144,10 @@ Unsolicited events; the first line on every new connection is a `state`:
 | `invite` | we were invited | `{room, name, inviter?, inviter_name?, direct}` |
 | `rooms_changed` | our membership, a receipt, an unread flag or a latest event changed | |
 | `message_edited` | one of a room's messages was edited | `{room, event_id, body, html?}` |
+| `reaction` | someone reacted | `{room, event_id, key, sender: {id, name}, reaction_id}` |
+| `redacted` | a message or reaction was removed | `{room, event_id}` |
+| `typing` | who is typing in a room (empty when nobody) | `{room, users: [{id, name}]}` |
+| `receipt` | others' read receipts moved | `{room, event_id, users}` |
 | `verification` | a verification flow moved | `{flow_id, other_user, other_device?, outgoing, state, emojis?, reason?}` — state is requested, ready, emoji, confirmed, done or cancelled |
 | `verification_status_changed` | identity, backup or recovery changed | |
 
@@ -190,7 +199,7 @@ package builds `--frozen`.
 
 ## Roadmap
 
-1. Reactions, typing, receipts (Tier 2).
+1. Room info and management (Tier 2).
 3. **Keyring** — store passphrase in the Secret Service instead of `session.json`.
 
 ## License

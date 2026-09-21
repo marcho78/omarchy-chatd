@@ -38,8 +38,12 @@ use matrix_sdk::{
         events::{
             AnySyncMessageLikeEvent, AnySyncTimelineEvent, EmptyStateKey, InitialStateEvent, SyncMessageLikeEvent,
             receipt::ReceiptThread,
-            relation::Replacement,
+            reaction::{OriginalSyncReactionEvent, ReactionEventContent},
+            receipt::{ReceiptType as EphemeralReceiptType, SyncReceiptEvent},
+            relation::{Annotation, Replacement},
+            typing::SyncTypingEvent,
             room::{
+                redaction::OriginalSyncRoomRedactionEvent,
                 encryption::RoomEncryptionEventContent,
                 member::{MembershipState, OriginalSyncRoomMemberEvent, StrippedRoomMemberEvent},
                 message::{
@@ -60,8 +64,9 @@ use tracing::{info, warn};
 use url::Url;
 
 use crate::protocol::{
-    Command, DirectoryRoom, DirectoryUser, Event, InviteInfo, Message, MessageEdit, ReplyPreview, Request,
-    Response, RoomInfo, Status, TimelinePage,
+    Command, DirectoryRoom, DirectoryUser, Event, InviteInfo, Message, MessageEdit, Reaction, ReactionEvent,
+    ReactionSender, ReceiptInfo, Redaction, ReplyPreview, Request, Response, RoomInfo, Status, TimelinePage,
+    TypingInfo, UserRef,
 };
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -121,6 +126,11 @@ pub struct Core {
     state: tokio::sync::Mutex<State>,
     /// Verification flows we are tracking: flow id -> other user.
     pub(crate) flows: tokio::sync::Mutex<std::collections::HashMap<String, matrix_sdk::ruma::OwnedUserId>>,
+    /// Reactions seen on a page whose target message was not on it: they
+    /// come from a newer page than the message they belong to, so keep
+    /// them per room until the target's page is loaded.
+    /// room -> target event -> (key, sender, reaction event id)
+    pending_reactions: tokio::sync::Mutex<std::collections::HashMap<String, std::collections::HashMap<String, Vec<(String, matrix_sdk::ruma::OwnedUserId, String)>>>>,
 }
 
 #[derive(Clone)]
@@ -135,7 +145,7 @@ impl Core {
             .mode(0o700)
             .create(&data_dir)
             .with_context(|| format!("creating {}", data_dir.display()))?;
-        Ok(Arc::new(Self { data_dir, events, state: Default::default(), flows: Default::default() }))
+        Ok(Arc::new(Self { data_dir, events, state: Default::default(), flows: Default::default(), pending_reactions: Default::default() }))
     }
 
     pub fn events(&self) -> &broadcast::Sender<Event> {
@@ -215,6 +225,29 @@ impl Core {
             Command::Edit { room, event_id, body } => {
                 let id = self.edit(&room, &event_id, body).await?;
                 Ok(json!({ "event_id": id }))
+            }
+            Command::Delete { room, event_id } => {
+                let r = self.room(&room).await?;
+                let id = matrix_sdk::ruma::EventId::parse(&event_id).context("invalid event id")?;
+                r.redact(&id, None, None).await.context("deleting")?;
+                Ok(json!({}))
+            }
+            Command::React { room, event_id, key } => {
+                let r = self.room(&room).await?;
+                let id = matrix_sdk::ruma::EventId::parse(&event_id).context("invalid event id")?;
+                let resp = r.send(ReactionEventContent::new(Annotation::new(id, key))).await.context("reacting")?;
+                Ok(json!({ "reaction_id": resp.response.event_id.to_string() }))
+            }
+            Command::Unreact { room, reaction_id } => {
+                let r = self.room(&room).await?;
+                let id = matrix_sdk::ruma::EventId::parse(&reaction_id).context("invalid event id")?;
+                r.redact(&id, None, None).await.context("removing reaction")?;
+                Ok(json!({}))
+            }
+            Command::Typing { room, typing } => {
+                let r = self.room(&room).await?;
+                r.typing_notice(typing).await.context("typing notice")?;
+                Ok(json!({}))
             }
             Command::MarkRead { room, event_id } => {
                 self.mark_read(&room, &event_id).await?;
@@ -506,10 +539,18 @@ impl Core {
     // ---------- sync loop ----------
 
     async fn start(self: &Arc<Self>, client: Client, sync_token: Option<String>) {
+        // The event cache keeps a synced timeline per room; the unread fallback reads it.
+        if let Err(e) = client.event_cache().subscribe() {
+            warn!("event cache: {e:#}");
+        }
         client.add_event_handler_context(HandlerCtx { events: self.events.clone() });
         client.add_event_handler(on_room_message);
         client.add_event_handler(on_stripped_member);
         client.add_event_handler(on_member);
+        client.add_event_handler(on_reaction);
+        client.add_event_handler(on_redaction);
+        client.add_event_handler(on_typing);
+        client.add_event_handler(on_receipt);
         crate::verify::install_handlers(self, &client);
 
         let core = self.clone();
@@ -681,22 +722,45 @@ impl Core {
             .map(|s| s.is_encrypted())
             .unwrap_or(false);
         let counts = room.unread_notification_counts();
-        let read_marker = match room.client().user_id() {
-            Some(me) => room
-                .load_user_receipt(StoreReceiptType::Read, &ReceiptThread::Unthreaded, me)
-                .await
-                .ok()
-                .flatten()
-                .map(|(eid, _)| eid.to_string()),
-            None => None,
-        };
+        let me = room.client().user_id().map(|u| u.to_owned());
+        let mut read_marker = None;
+        let mut read_at: Option<u64> = None;
+        if let Some(me) = me.as_deref() {
+            for thread in [ReceiptThread::Unthreaded, ReceiptThread::Main] {
+                if let Ok(Some((eid, receipt))) = room.load_user_receipt(StoreReceiptType::Read, &thread, me).await {
+                    read_marker = Some(eid.to_string());
+                    read_at = receipt.ts.map(|t| t.0.into());
+                    break;
+                }
+            }
+        }
+        // The SDK's counter only resolves once the receipt's event has come
+        // through sync; a receipt placed on paged history leaves it at 0. So
+        // also count what the cache holds from others after we last read.
+        let mut unread = room.num_unread_messages();
+        if let (Some(me), Some(at)) = (me.as_deref(), read_at) {
+            if let Ok((cache, _guard)) = room.event_cache().await {
+                if let Ok(events) = cache.events().await {
+                    let mut n = 0u64;
+                    for ev in events {
+                        if let Ok(AnySyncTimelineEvent::MessageLike(m)) = ev.raw().deserialize() {
+                            let is_msg = matches!(m, AnySyncMessageLikeEvent::RoomMessage(_) | AnySyncMessageLikeEvent::RoomEncrypted(_));
+                            if is_msg && m.sender() != me && u64::from(m.origin_server_ts().0) > at {
+                                n += 1;
+                            }
+                        }
+                    }
+                    unread = unread.max(n);
+                }
+            }
+        }
         RoomInfo {
             id: room.room_id().to_string(),
             name,
             topic: room.topic(),
             encrypted,
             direct: room.is_direct().await.unwrap_or(false),
-            unread: room.num_unread_messages(),
+            unread,
             highlights: room.num_unread_mentions().max(counts.highlight_count),
             notifications: counts.notification_count,
             read_marker,
@@ -802,6 +866,13 @@ impl Core {
         let mut next: Option<String> = None;
         // A chunk can be nothing but state events (room creation, joins);
         // keep going so a page always carries messages or the real end.
+        // Reactions on this page keyed by their target; plus any carried
+        // over from newer pages whose targets we are about to see.
+        let mut reactions: std::collections::HashMap<String, Vec<(String, matrix_sdk::ruma::OwnedUserId, String)>> = {
+            let mut p = self.pending_reactions.lock().await;
+            p.remove(room_id).unwrap_or_default()
+        };
+        let mut redacted: std::collections::HashSet<String> = Default::default();
         for _ in 0..6 {
             let mut opts = MessagesOptions::backward();
             opts.limit = UInt::from(limit.clamp(1, 200));
@@ -809,6 +880,21 @@ impl Core {
             let page = room.messages(opts).await.context("fetching messages")?;
             let raw_count = page.chunk.len();
             for ev in page.chunk {
+                if let Ok(AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::Reaction(
+                    SyncMessageLikeEvent::Original(r),
+                ))) = ev.raw().deserialize()
+                {
+                    let a = &r.content.relates_to;
+                    reactions.entry(a.event_id.to_string()).or_default().push((a.key.clone(), r.sender.clone(), r.event_id.to_string()));
+                    continue;
+                }
+                if let Ok(AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::RoomRedaction(
+                    matrix_sdk::ruma::events::room::redaction::SyncRoomRedactionEvent::Original(rd),
+                ))) = ev.raw().deserialize()
+                {
+                    redacted.insert(rd.redacts(&room.clone_info().room_version_rules_or_default().redaction).to_string());
+                    continue;
+                }
                 if let Some(m) = self.message_from_event(&room, ev).await {
                     out.push(m);
                 }
@@ -821,6 +907,18 @@ impl Core {
                 break;
             }
             from = next.clone();
+        }
+        let me = room.client().user_id().map(|u| u.to_owned());
+        for m in out.iter_mut() {
+            if let Some(mut list) = reactions.remove(&m.event_id) {
+                list.reverse(); // collected newest-first; chips read oldest-first
+                m.reactions = aggregate_reactions(&room, list, me.as_deref(), &redacted).await;
+            }
+            m.read_by = read_by(&room, &m.event_id, me.as_deref()).await;
+        }
+        // Whatever is left targets messages on an older page.
+        if !reactions.is_empty() {
+            self.pending_reactions.lock().await.insert(room_id.to_owned(), reactions);
         }
         out.reverse(); // backward pagination yields newest first
         Ok(TimelinePage { messages: out, next })
@@ -847,6 +945,14 @@ impl Core {
                 }
                 Some(m)
             }
+            // A redacted message keeps its place with empty content — in an
+            // encrypted room the shell that remains is an m.room.encrypted.
+            AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::RoomMessage(
+                SyncMessageLikeEvent::Redacted(r),
+            )) => Some(deleted_placeholder(room, &r.sender, &r.event_id, r.origin_server_ts, encrypted).await),
+            AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::RoomEncrypted(
+                SyncMessageLikeEvent::Redacted(r),
+            )) => Some(deleted_placeholder(room, &r.sender, &r.event_id, r.origin_server_ts, true).await),
             // Still encrypted: we have no key (yet). Show a placeholder so
             // the gap is visible; backup or key sharing may fill it later.
             AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::RoomEncrypted(
@@ -869,6 +975,9 @@ impl Core {
                     attachment: None,
                     reply_to: None,
                     edited: false,
+                    reactions: Vec::new(),
+                    read_by: Vec::new(),
+                    deleted: false,
                 })
             }
             _ => None,
@@ -1070,6 +1179,147 @@ async fn to_message(room: &Room, ev: OriginalSyncRoomMessageEvent, encrypted: bo
         attachment: crate::media::attachment_of(&ev.content.msgtype),
         reply_to,
         edited: false,
+        reactions: Vec::new(),
+        read_by: Vec::new(),
+        deleted: false,
+    }
+}
+
+async fn deleted_placeholder(
+    room: &Room,
+    sender: &matrix_sdk::ruma::UserId,
+    event_id: &matrix_sdk::ruma::EventId,
+    ts: matrix_sdk::ruma::MilliSecondsSinceUnixEpoch,
+    encrypted: bool,
+) -> Message {
+    let sender_name = match room.get_member_no_sync(sender).await {
+        Ok(Some(m)) => m.name().to_owned(),
+        _ => sender.localpart().to_owned(),
+    };
+    Message {
+        room: room.room_id().to_string(),
+        event_id: event_id.to_string(),
+        sender: sender.to_string(),
+        sender_name,
+        body: String::new(),
+        html: None,
+        msgtype: "m.text".to_owned(),
+        ts: ts.0.into(),
+        encrypted,
+        attachment: None,
+        reply_to: None,
+        edited: false,
+        reactions: Vec::new(),
+        read_by: Vec::new(),
+        deleted: true,
+    }
+}
+
+async fn user_ref(room: &Room, user: &matrix_sdk::ruma::UserId) -> UserRef {
+    let name = match room.get_member_no_sync(user).await {
+        Ok(Some(m)) => m.name().to_owned(),
+        _ => user.localpart().to_owned(),
+    };
+    UserRef { id: user.to_string(), name }
+}
+
+/// Group raw reactions by key, count them, and remember our own event id.
+async fn aggregate_reactions(
+    room: &Room,
+    list: Vec<(String, matrix_sdk::ruma::OwnedUserId, String)>,
+    me: Option<&matrix_sdk::ruma::UserId>,
+    redacted: &std::collections::HashSet<String>,
+) -> Vec<Reaction> {
+    let mut order: Vec<String> = Vec::new();
+    let mut by_key: std::collections::HashMap<String, Reaction> = Default::default();
+    for (key, sender, id) in list {
+        if redacted.contains(&id) {
+            continue;
+        }
+        let entry = by_key.entry(key.clone()).or_insert_with(|| {
+            order.push(key.clone());
+            Reaction { key: key.clone(), count: 0, senders: Vec::new(), mine: None }
+        });
+        // One reaction per user per key.
+        if entry.senders.iter().any(|u| u.id == sender.as_str()) {
+            continue;
+        }
+        entry.count += 1;
+        if me == Some(sender.as_ref()) {
+            entry.mine = Some(id.clone());
+        }
+        let u = user_ref(room, &sender).await;
+        entry.senders.push(ReactionSender { id: u.id, name: u.name, reaction_id: id });
+    }
+    order.into_iter().filter_map(|k| by_key.remove(&k)).collect()
+}
+
+/// Others whose read receipt sits on this event. Clients send receipts
+/// either unthreaded or on the main thread; both mean "read up to here".
+async fn read_by(room: &Room, event_id: &str, me: Option<&matrix_sdk::ruma::UserId>) -> Vec<UserRef> {
+    let Ok(id) = matrix_sdk::ruma::EventId::parse(event_id) else { return Vec::new() };
+    let mut out: Vec<UserRef> = Vec::new();
+    for thread in [ReceiptThread::Unthreaded, ReceiptThread::Main] {
+        let Ok(list) = room.load_event_receipts(StoreReceiptType::Read, &thread, &id).await else { continue };
+        for (user, _) in list {
+            if me == Some(user.as_ref()) || out.iter().any(|u| u.id == user.as_str()) {
+                continue;
+            }
+            out.push(user_ref(room, &user).await);
+        }
+    }
+    out
+}
+
+async fn on_reaction(event: OriginalSyncReactionEvent, room: Room, ctx: Ctx<HandlerCtx>) {
+    if room.state() != RoomState::Joined {
+        return;
+    }
+    let a = &event.content.relates_to;
+    let _ = ctx.events.send(Event::Reaction(ReactionEvent {
+        room: room.room_id().to_string(),
+        event_id: a.event_id.to_string(),
+        key: a.key.clone(),
+        sender: user_ref(&room, &event.sender).await,
+        reaction_id: event.event_id.to_string(),
+    }));
+}
+
+async fn on_redaction(event: OriginalSyncRoomRedactionEvent, room: Room, ctx: Ctx<HandlerCtx>) {
+    if room.state() != RoomState::Joined {
+        return;
+    }
+    let rules = room.clone_info().room_version_rules_or_default();
+    let target = event.redacts(&rules.redaction);
+    let _ = ctx.events.send(Event::Redacted(Redaction { room: room.room_id().to_string(), event_id: target.to_string() }));
+}
+
+async fn on_typing(event: SyncTypingEvent, room: Room, client: Client, ctx: Ctx<HandlerCtx>) {
+    let mut users = Vec::new();
+    for u in &event.content.user_ids {
+        if client.user_id().is_some_and(|me| me == u) {
+            continue;
+        }
+        users.push(user_ref(&room, u).await);
+    }
+    let _ = ctx.events.send(Event::Typing(TypingInfo { room: room.room_id().to_string(), users }));
+}
+
+async fn on_receipt(event: SyncReceiptEvent, room: Room, client: Client, ctx: Ctx<HandlerCtx>) {
+    // One event can carry receipts for several messages; group by message.
+    let mut by_event: std::collections::HashMap<String, Vec<UserRef>> = Default::default();
+    for (event_id, receipts) in event.content.0.iter() {
+        if let Some(users) = receipts.get(&EphemeralReceiptType::Read) {
+            for (user, _) in users {
+                if client.user_id().is_some_and(|me| me == user) {
+                    continue;
+                }
+                by_event.entry(event_id.to_string()).or_default().push(user_ref(&room, user).await);
+            }
+        }
+    }
+    for (event_id, users) in by_event {
+        let _ = ctx.events.send(Event::Receipt(ReceiptInfo { room: room.room_id().to_string(), event_id, users }));
     }
 }
 
