@@ -476,6 +476,9 @@ pub struct RoomInfo {
     /// Our read receipt / fully-read marker, if we have one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub read_marker: Option<String>,
+    /// Set when the room mirrors another network through a bridge.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bridge: Option<crate::bridge::BridgeInfo>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -534,6 +537,9 @@ pub struct Message {
     /// Set on a message that has a thread under it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thread: Option<ThreadInfo>,
+    /// The sender is a bridge puppet (or bot) for this network, e.g. "WhatsApp".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub via: Option<String>,
 }
 
 /// What a thread root shows in the room timeline.
@@ -675,6 +681,8 @@ pub struct RoomDetails {
     /// all | mentions | mute; `custom` is false when it is the account default.
     pub notification_mode: String,
     pub notification_custom: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bridge: Option<crate::bridge::BridgeInfo>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -686,6 +694,9 @@ pub struct MemberInfo {
     pub power: i64,
     /// admin | moderator | member
     pub role: String,
+    /// The network this member is a puppet of (or its bridge bot).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub via: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]

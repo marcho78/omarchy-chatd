@@ -1211,6 +1211,7 @@ impl Core {
             highlights: room.num_unread_mentions().max(counts.highlight_count),
             notifications: counts.notification_count,
             read_marker,
+            bridge: crate::bridge::detect(room).await,
         }
     }
 
@@ -1764,6 +1765,7 @@ impl Core {
                     highlight: None,
                     thread_root: None,
                     thread: None,
+                    via: None,
                 })
             }
             // A redacted message keeps its place with empty content — in an
@@ -1809,6 +1811,7 @@ impl Core {
                     highlight: None,
                     thread_root: None,
                     thread: None,
+                    via: None,
                 })
             }
             _ => None,
@@ -2258,6 +2261,7 @@ async fn to_message(room: &Room, ev: OriginalSyncRoomMessageEvent, encrypted: bo
         highlight: None,
         thread_root,
         thread: None,
+        via: crate::bridge::protocol_of_user(&ev.sender).map(crate::bridge::display_name),
     }
 }
 
@@ -2293,6 +2297,7 @@ async fn deleted_placeholder(
         highlight: None,
         thread_root: None,
         thread: None,
+        via: None,
     }
 }
 
@@ -2555,6 +2560,7 @@ impl Core {
         let direct = room.is_direct().await.unwrap_or(false);
         let (notification_mode, notification_custom) =
             self.notification_mode(&room, encrypted, direct).await;
+        let bridge = crate::bridge::detect(&room).await;
         Ok(RoomDetails {
             id: room.room_id().to_string(),
             name,
@@ -2565,6 +2571,7 @@ impl Core {
             direct,
             notification_mode,
             notification_custom,
+            bridge,
             join_rule,
             member_count: room.joined_members_count(),
             can_invite,
@@ -2961,6 +2968,8 @@ impl Core {
                     avatar: m.avatar_url().map(|u| u.to_string()),
                     power,
                     role: role_of(power).to_owned(),
+                    via: crate::bridge::protocol_of_user(m.user_id())
+                        .map(crate::bridge::display_name),
                 }
             })
             .collect();

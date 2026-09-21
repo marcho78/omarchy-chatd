@@ -6,6 +6,7 @@
 //! Socket: `$XDG_RUNTIME_DIR/omarchy-yapper.sock`, mode 0600, and every
 //! connection is checked against our own uid via SO_PEERCRED.
 
+mod bridge;
 mod core;
 mod media;
 mod protocol;
