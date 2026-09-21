@@ -109,6 +109,9 @@ the response echoes.
 | `room_details` | `room` | `{id, name, topic?, avatar?, alias?, encrypted, direct, join_rule, member_count, can_invite, can_kick, can_ban, can_set_name, can_set_topic, can_redact_other}` |
 | `members` | `room`, `query?`, `limit` | `[{id, name, avatar?, power, role}]`, most powerful first |
 | `avatar` | `url` (mxc) | `{path}` — 96px square in `~/.cache/omarchy-yapper/avatars/` |
+| `invite` / `kick` / `ban` | `room`, `user`, `reason?` | `{}` |
+| `set_name` / `set_topic` | `room`, `name` / `topic` | `{}` |
+| `set_notification_mode` | `room`, `mode` (all, mentions, mute, default) | room details |
 | `mark_read` | `room`, `event_id` | `{}` — public read receipt and fully-read marker |
 | `search_rooms` | `query`, `server?`, `limit` | `[{id, name, alias?, topic?, members, joined}]` |
 | `join` | `room` (alias or id) | room info |
@@ -204,7 +207,7 @@ package builds `--frozen`.
 
 ## Roadmap
 
-1. Room management: invite, kick, name/topic, mute (Tier 2).
+1. Push-rule-aware notifications, click to open (Tier 2).
 3. **Keyring** — store passphrase in the Secret Service instead of `session.json`.
 
 ## License

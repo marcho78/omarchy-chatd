@@ -108,6 +108,10 @@ struct PendingLogin {
 #[derive(Default)]
 struct State {
     client: Option<Client>,
+    /// One instance for the session: it applies its own writes locally, so
+    /// reads right after a change are consistent (a fresh instance would
+    /// be built from account data that only refreshes with the next sync).
+    notification_settings: Option<matrix_sdk::notification_settings::NotificationSettings>,
     sync_task: Option<JoinHandle<()>>,
     pending: Option<PendingLogin>,
     syncing: bool,
@@ -254,6 +258,42 @@ impl Core {
             Command::Avatar { url } => {
                 let path = self.avatar(&url).await?;
                 Ok(json!({ "path": path }))
+            }
+            Command::Invite { room, user } => {
+                let r = self.room(&room).await?;
+                let u = UserId::parse(user.trim()).context("expected @user:server")?;
+                r.invite_user_by_id(&u).await.context("inviting")?;
+                Ok(json!({}))
+            }
+            Command::Kick { room, user, reason } => {
+                let r = self.room(&room).await?;
+                let u = UserId::parse(user.trim()).context("expected @user:server")?;
+                r.kick_user(&u, reason.as_deref().filter(|s| !s.trim().is_empty())).await.context("removing")?;
+                Ok(json!({}))
+            }
+            Command::Ban { room, user, reason } => {
+                let r = self.room(&room).await?;
+                let u = UserId::parse(user.trim()).context("expected @user:server")?;
+                r.ban_user(&u, reason.as_deref().filter(|s| !s.trim().is_empty())).await.context("banning")?;
+                Ok(json!({}))
+            }
+            Command::SetName { room, name } => {
+                let r = self.room(&room).await?;
+                let n = name.trim().to_owned();
+                if n.is_empty() {
+                    bail!("a room needs a name");
+                }
+                r.set_name(n).await.context("renaming")?;
+                Ok(json!({}))
+            }
+            Command::SetTopic { room, topic } => {
+                let r = self.room(&room).await?;
+                r.set_room_topic(topic.trim()).await.context("setting topic")?;
+                Ok(json!({}))
+            }
+            Command::SetNotificationMode { room, mode } => {
+                self.set_notification_mode(&room, &mode).await?;
+                Ok(serde_json::to_value(self.room_details(&room).await?)?)
             }
             Command::MarkRead { room, event_id } => {
                 self.mark_read(&room, &event_id).await?;
@@ -511,6 +551,7 @@ impl Core {
     async fn logout(self: &Arc<Self>) -> Result<()> {
         let (client, task, pending) = {
             let mut st = self.state.lock().await;
+            st.notification_settings = None;
             (st.client.take(), st.sync_task.take(), st.pending.take())
         };
         if let Some(task) = task {
@@ -611,8 +652,10 @@ impl Core {
             }
         });
 
+        let notification_settings = client.notification_settings().await;
         let mut st = self.state.lock().await;
         st.client = Some(client);
+        st.notification_settings = Some(notification_settings);
         st.sync_task = Some(task);
         st.pending = None;
         st.error = None;
@@ -760,13 +803,16 @@ impl Core {
                 }
             }
         }
+        let direct = room.is_direct().await.unwrap_or(false);
+        let (notification_mode, _) = self.notification_mode(&room, encrypted, direct).await;
         RoomInfo {
             id: room.room_id().to_string(),
             name,
             topic: room.topic(),
             encrypted,
-            direct: room.is_direct().await.unwrap_or(false),
+            direct,
             avatar: room.avatar_url().map(|u| u.to_string()),
+            notification_mode,
             unread,
             highlights: room.num_unread_mentions().max(counts.highlight_count),
             notifications: counts.notification_count,
@@ -1437,14 +1483,19 @@ impl Core {
             _ => "other",
         }
         .to_owned();
+        let encrypted = room.latest_encryption_state().await.map(|s| s.is_encrypted()).unwrap_or(false);
+        let direct = room.is_direct().await.unwrap_or(false);
+        let (notification_mode, notification_custom) = self.notification_mode(&room, encrypted, direct).await;
         Ok(RoomDetails {
             id: room.room_id().to_string(),
             name,
             topic: room.topic(),
             avatar: room.avatar_url().map(|u| u.to_string()),
             alias: room.canonical_alias().map(|a| a.to_string()),
-            encrypted: room.latest_encryption_state().await.map(|s| s.is_encrypted()).unwrap_or(false),
-            direct: room.is_direct().await.unwrap_or(false),
+            encrypted,
+            direct,
+            notification_mode,
+            notification_custom,
             join_rule,
             member_count: room.joined_members_count(),
             can_invite,
@@ -1454,6 +1505,49 @@ impl Core {
             can_set_topic,
             can_redact_other,
         })
+    }
+
+    /// The room's effective notification mode and whether it is room-specific.
+    async fn settings(&self) -> Result<matrix_sdk::notification_settings::NotificationSettings> {
+        self.state.lock().await.notification_settings.clone().ok_or_else(|| anyhow!("not logged in"))
+    }
+
+    async fn notification_mode(&self, room: &Room, encrypted: bool, direct: bool) -> (String, bool) {
+        use matrix_sdk::notification_settings::{IsEncrypted, IsOneToOne, RoomNotificationMode as M};
+        let Ok(settings) = self.settings().await else { return ("all".to_owned(), false) };
+        let (mode, custom) = match settings.get_user_defined_room_notification_mode(room.room_id()).await {
+            Some(m) => (m, true),
+            None => (settings.get_default_room_notification_mode(IsEncrypted::from(encrypted), IsOneToOne::from(direct)).await, false),
+        };
+        let name = match mode {
+            M::AllMessages => "all",
+            M::MentionsAndKeywordsOnly => "mentions",
+            M::Mute => "mute",
+        };
+        (name.to_owned(), custom)
+    }
+
+    pub(crate) async fn set_notification_mode(&self, room_id: &str, mode: &str) -> Result<()> {
+        use matrix_sdk::notification_settings::RoomNotificationMode as M;
+        let room = self.room(room_id).await?;
+        let settings = self.settings().await?;
+        let result = match mode {
+            "all" => settings.set_room_notification_mode(room.room_id(), M::AllMessages).await,
+            "mentions" => settings.set_room_notification_mode(room.room_id(), M::MentionsAndKeywordsOnly).await,
+            "mute" => settings.set_room_notification_mode(room.room_id(), M::Mute).await,
+            "default" => settings.delete_user_defined_room_rules(room.room_id()).await,
+            other => bail!("unknown mode {other}; use all, mentions, mute or default"),
+        };
+        match result {
+            Ok(()) => {}
+            // Resetting when one of the rules is already gone is still a reset.
+            Err(e) if mode == "default" && e.to_string().contains("M_NOT_FOUND") => {
+                warn!("notification rules partly missing while resetting: {e}");
+            }
+            Err(e) => return Err(e).context("updating notification settings"),
+        }
+        let _ = self.events().send(Event::RoomsChanged);
+        Ok(())
     }
 
     pub(crate) async fn members(&self, room_id: &str, query: &str, limit: u32) -> Result<Vec<MemberInfo>> {

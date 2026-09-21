@@ -79,6 +79,18 @@ pub enum Command {
     /// Fetch an avatar (a user's or a room's mxc:// URL) into the media cache
     /// as a small square; returns `{path}`.
     Avatar { url: String },
+    /// Invite a user to a room.
+    Invite { room: String, user: String },
+    /// Remove a user from a room (they may rejoin).
+    Kick { room: String, user: String, #[serde(default)] reason: Option<String> },
+    /// Ban a user from a room.
+    Ban { room: String, user: String, #[serde(default)] reason: Option<String> },
+    /// Rename a room.
+    SetName { room: String, name: String },
+    /// Change a room's topic.
+    SetTopic { room: String, topic: String },
+    /// Per-room notification mode: all | mentions | mute | default.
+    SetNotificationMode { room: String, mode: String },
     /// Mark the room read up to the given event: public read receipt plus
     /// the fully-read marker, so every client and device agrees.
     MarkRead { room: String, event_id: String },
@@ -324,6 +336,8 @@ pub struct RoomInfo {
     pub highlights: u64,
     /// What the server would push about (its notification count).
     pub notifications: u64,
+    /// all | mentions | mute — how this room should notify.
+    pub notification_mode: String,
     /// Our read receipt / fully-read marker, if we have one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub read_marker: Option<String>,
@@ -451,6 +465,9 @@ pub struct RoomDetails {
     pub can_set_name: bool,
     pub can_set_topic: bool,
     pub can_redact_other: bool,
+    /// all | mentions | mute; `custom` is false when it is the account default.
+    pub notification_mode: String,
+    pub notification_custom: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
