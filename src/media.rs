@@ -29,6 +29,9 @@ use crate::{core::Core, protocol::Attachment};
 
 const THUMB_SIZE: u32 = 640;
 const MAX_UPLOAD: u64 = 100 * 1024 * 1024;
+/// ffmpeg loudness filter for voice: the usual speech target, with a
+/// true-peak ceiling so it never clips.
+const LOUDNORM: &str = "loudnorm=I=-16:TP=-1.5:LRA=11";
 
 /// What the client needs to know to render an attachment message.
 pub fn attachment_of(msgtype: &MessageType) -> Option<Attachment> {
@@ -200,6 +203,7 @@ impl Core {
             bail!("not a message event");
         };
 
+        let is_voice = matches!(&msg.content.msgtype, MessageType::Audio(c) if c.voice.is_some());
         let (bytes, mime, name): (Vec<u8>, String, String) = match &msg.content.msgtype {
             MessageType::Image(c) => {
                 fetch(
@@ -247,6 +251,33 @@ impl Core {
         let path = cache_dir()?.join(cache_name(event_id, thumbnail, Some(&mime), &name));
         if !path.exists() {
             std::fs::write(&path, &bytes).with_context(|| format!("writing {}", path.display()))?;
+        }
+        // Voice notes arrive at whatever level they were recorded; hand the
+        // player a loudness-normalised copy when ffmpeg can make one.
+        if is_voice {
+            let norm = path.with_file_name(format!(
+                "{}-norm.ogg",
+                path.file_stem()
+                    .map(|s| s.to_string_lossy())
+                    .unwrap_or_default()
+            ));
+            if !norm.exists() {
+                let ok = tokio::process::Command::new("ffmpeg")
+                    .args(["-y", "-loglevel", "error", "-i"])
+                    .arg(&path)
+                    .args(["-af", LOUDNORM, "-c:a", "libopus", "-b:a", "48k"])
+                    .arg(&norm)
+                    .status()
+                    .await
+                    .map(|st| st.success())
+                    .unwrap_or(false);
+                if !ok {
+                    let _ = std::fs::remove_file(&norm);
+                }
+            }
+            if norm.exists() {
+                return Ok((norm.to_string_lossy().into_owned(), "audio/ogg".to_owned()));
+            }
         }
         Ok((path.to_string_lossy().into_owned(), mime))
     }
@@ -326,7 +357,17 @@ impl Core {
         let encoded = tokio::process::Command::new("ffmpeg")
             .args(["-y", "-loglevel", "error", "-i"])
             .arg(&wav_path)
-            .args(["-c:a", "libopus", "-b:a", "32k", "-application", "voip"])
+            // Speech-level loudness whatever the mic's gain was.
+            .args([
+                "-af",
+                LOUDNORM,
+                "-c:a",
+                "libopus",
+                "-b:a",
+                "32k",
+                "-application",
+                "voip",
+            ])
             .arg(&ogg_path)
             .status()
             .await
