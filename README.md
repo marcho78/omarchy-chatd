@@ -14,7 +14,7 @@ cryptography of its own.
 No binaries are shipped. You build it from this source:
 
 ```bash
-git clone https://github.com/marcho78/omarchy-chatd && cd omarchy-chatd && makepkg -si
+git clone https://github.com/marcho78/omarchy-chatd && cd omarchy-chatd/packaging && makepkg -si
 ```
 
 `makepkg` pulls `cargo` if needed, compiles the daemon (several minutes the
@@ -26,7 +26,7 @@ login instead:
 systemctl --user enable --now omarchy-chatd
 ```
 
-Update: `git pull && makepkg -si`. Remove: `pacman -R omarchy-chatd`.
+Update: `git pull && cd packaging && makepkg -si`. Remove: `pacman -R omarchy-chatd`.
 
 ## What it stores
 
