@@ -2310,7 +2310,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "omarchy-chatd"
+name = "omarchy-yapperd"
 version = "0.1.0"
 dependencies = [
  "anyhow",

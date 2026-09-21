@@ -60,8 +60,8 @@ use crate::protocol::{
 };
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
-const DEVICE_NAME: &str = "Omarchy Chat";
-const CLIENT_URI: &str = "https://github.com/marcho78/omarchy-chat";
+const DEVICE_NAME: &str = "Yapper";
+const CLIENT_URI: &str = "https://github.com/marcho78/omarchy-yapper";
 /// How long a browser sign-in may sit waiting for the redirect.
 const OAUTH_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 /// Directory searches, especially on a remote server, can stall on federation.

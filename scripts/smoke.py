@@ -1,12 +1,12 @@
 #!/usr/bin/python3
-"""Talk to a running omarchy-chatd over its socket.
+"""Talk to a running omarchy-yapperd over its socket.
 
     scripts/smoke.py                      # status + rooms against the default socket
     scripts/smoke.py --socket /path.sock  # against a test daemon
     scripts/smoke.py '{"cmd":"rooms"}'    # send one request and print the reply
 
 Start a throwaway daemon for testing with:
-    omarchy-chatd --socket /tmp/chat-test.sock --data-dir /tmp/chat-test-data
+    omarchy-yapperd --socket /tmp/yapper-test.sock --data-dir /tmp/yapper-test-data
 """
 import json
 import os
@@ -16,7 +16,7 @@ import sys
 
 def main() -> int:
     args = sys.argv[1:]
-    path = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "omarchy-chat.sock")
+    path = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "omarchy-yapper.sock")
     if args[:1] == ["--socket"]:
         path, args = args[1], args[2:]
     requests = [json.loads(a) for a in args] or [{"cmd": "status"}, {"cmd": "rooms"}]

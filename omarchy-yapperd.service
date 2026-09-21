@@ -1,0 +1,18 @@
+[Unit]
+Description=Yapper daemon (end-to-end encrypted Matrix session)
+Documentation=https://github.com/marcho78/omarchy-yapperd
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/omarchy-yapperd
+Restart=on-failure
+RestartSec=3
+# The daemon writes only to ~/.local/share/omarchy-yapperd and $XDG_RUNTIME_DIR.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=full
+UMask=0077
+
+[Install]
+WantedBy=default.target

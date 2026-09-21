@@ -1,6 +1,6 @@
-# omarchy-chatd
+# omarchy-yapperd
 
-The daemon behind [Chat for Omarchy](https://github.com/marcho78/omarchy-chat),
+The daemon behind [Yapper](https://github.com/marcho78/omarchy-yapper),
 an end-to-end encrypted Matrix chat that lives in the Omarchy bar.
 
 It owns the Matrix session, the encryption keys and the sync loop, and talks
@@ -13,8 +13,8 @@ same stack as Element X. This daemon adds no cryptography of its own.
 
 ```
 ┌──────────────────────────┐   JSON lines    ┌──────────────────────┐   HTTPS    ┌────────────┐
-│ omarchy-shell            │  over a 0600    │ omarchy-chatd        │  (Matrix   │ homeserver │
-│  └ marcho78.chat (QML)   │◄──────────────►│  matrix-rust-sdk     │◄─────────►│            │
+│ omarchy-shell            │  over a 0600    │ omarchy-yapperd        │  (Matrix   │ homeserver │
+│  └ marcho78.yapper (QML) │◄──────────────►│  matrix-rust-sdk     │◄─────────►│            │
 │    renders, forwards     │  Unix socket    │  keys, store, sync   │  client-   │ sees only  │
 │    what you type         │                 │                      │  server)   │ ciphertext │
 └──────────────────────────┘                 └──────────────────────┘            └────────────┘
@@ -25,7 +25,7 @@ same stack as Element X. This daemon adds no cryptography of its own.
 No binaries are shipped. You build it from this source with `makepkg`:
 
 ```bash
-git clone https://github.com/marcho78/omarchy-chatd && cd omarchy-chatd/packaging && makepkg -si
+git clone https://github.com/marcho78/omarchy-yapperd && cd omarchy-yapperd/packaging && makepkg -si
 ```
 
 `makepkg -s` installs `cargo` from the Arch repos if it is missing, builds the
@@ -34,17 +34,17 @@ daemon (several minutes the first time — matrix-rust-sdk is large), and
 a systemd user unit, this README and the license; it depends only on
 `gcc-libs`, `glibc` and `sqlite`.
 
-The Chat plugin starts the daemon on demand. To run it at login instead:
+The Yapper plugin starts the daemon on demand. To run it at login instead:
 
 ```bash
-systemctl --user enable --now omarchy-chatd
+systemctl --user enable --now omarchy-yapperd
 ```
 
 | | |
 |---|---|
 | Update | `git pull && cd packaging && makepkg -si` |
-| Remove | `pacman -R omarchy-chatd`, then `rm -rf ~/.local/share/omarchy-chatd` to drop the session and keys |
-| Logs | `journalctl --user -u omarchy-chatd -f` |
+| Remove | `pacman -R omarchy-yapperd`, then `rm -rf ~/.local/share/omarchy-yapperd` to drop the session and keys |
+| Logs | `journalctl --user -u omarchy-yapperd -f` |
 
 Why not the AUR? It is a distribution channel, not a trust mechanism; the
 `PKGBUILD` here does exactly what an AUR helper would do, minus the lookup. If
@@ -59,7 +59,7 @@ machine before it reaches the homeserver, which stores and relays ciphertext.
 **What it does not hide:** metadata. The homeserver knows your account, who
 you talk to, when, and in which rooms. That is inherent to Matrix.
 
-**On disk**, under `~/.local/share/omarchy-chatd/` (mode 0700):
+**On disk**, under `~/.local/share/omarchy-yapperd/` (mode 0700):
 
 | File | Mode | Contents |
 |---|---|---|
@@ -69,7 +69,7 @@ you talk to, when, and in which rooms. That is inherent to Matrix.
 Your password is used once for `login` and dropped. `logout` revokes the
 token on the server and deletes both entries.
 
-**On the socket** (`$XDG_RUNTIME_DIR/omarchy-chat.sock`):
+**On the socket** (`$XDG_RUNTIME_DIR/omarchy-yapper.sock`):
 
 * created with mode 0600 under a 0077 umask;
 * every connection is checked with `SO_PEERCRED` and refused unless the peer
@@ -121,17 +121,17 @@ Try it by hand:
 ```bash
 scripts/smoke.py                                  # status + rooms
 scripts/smoke.py '{"cmd":"timeline","room":"!abc:matrix.org","limit":5}'
-socat - UNIX-CONNECT:$XDG_RUNTIME_DIR/omarchy-chat.sock   # or interactively
+socat - UNIX-CONNECT:$XDG_RUNTIME_DIR/omarchy-yapper.sock   # or interactively
 ```
 
 ## Development
 
 ```bash
 cargo check                              # fast, catches API drift
-cargo build --release                    # target/release/omarchy-chatd
-target/release/omarchy-chatd --socket /tmp/chat-test.sock --data-dir /tmp/chat-test-data
-scripts/smoke.py --socket /tmp/chat-test.sock
-RUST_LOG=debug,matrix_sdk=info omarchy-chatd   # log filter, default info,matrix_sdk=warn
+cargo build --release                    # target/release/omarchy-yapperd
+target/release/omarchy-yapperd --socket /tmp/yapper-test.sock --data-dir /tmp/yapper-test-data
+scripts/smoke.py --socket /tmp/yapper-test.sock
+RUST_LOG=debug,matrix_sdk=info omarchy-yapperd   # log filter, default info,matrix_sdk=warn
 ```
 
 Layout:
@@ -141,7 +141,7 @@ src/main.rs        socket server, peer check, per-connection writer, signals
 src/core.rs        Client lifecycle: session file, login/logout, sync loop, commands
 src/protocol.rs    request / response / event types
 packaging/PKGBUILD builds from a clean checkout of this repo (git+file://)
-omarchy-chatd.service   systemd user unit installed by the package
+omarchy-yapperd.service   systemd user unit installed by the package
 ```
 
 `packaging/` is separate because makepkg's `$srcdir` is `./src` next to the

@@ -1,8 +1,8 @@
-//! omarchy-chatd: a per-user daemon that owns the Matrix session, keys and
+//! omarchy-yapperd: a per-user daemon that owns the Matrix session, keys and
 //! sync loop, and exposes them over a Unix socket so the Omarchy shell plugin
 //! (QML) never handles key material.
 //!
-//! Socket: `$XDG_RUNTIME_DIR/omarchy-chat.sock`, mode 0600, and every
+//! Socket: `$XDG_RUNTIME_DIR/omarchy-yapper.sock`, mode 0600, and every
 //! connection is checked against our own uid via SO_PEERCRED.
 
 mod core;
@@ -23,27 +23,27 @@ use tracing::{info, warn};
 use crate::core::Core;
 
 #[derive(Parser)]
-#[command(name = "omarchy-chatd", version, about)]
+#[command(name = "omarchy-yapperd", version, about)]
 struct Args {
-    /// Unix socket to listen on (default: $XDG_RUNTIME_DIR/omarchy-chat.sock)
+    /// Unix socket to listen on (default: $XDG_RUNTIME_DIR/omarchy-yapper.sock)
     #[arg(long)]
     socket: Option<PathBuf>,
-    /// Where the session and encrypted store live (default: $XDG_DATA_HOME/omarchy-chatd)
+    /// Where the session and encrypted store live (default: $XDG_DATA_HOME/omarchy-yapperd)
     #[arg(long)]
     data_dir: Option<PathBuf>,
 }
 
 fn default_socket() -> Result<PathBuf> {
     let dir = std::env::var_os("XDG_RUNTIME_DIR").context("XDG_RUNTIME_DIR is not set")?;
-    Ok(PathBuf::from(dir).join("omarchy-chat.sock"))
+    Ok(PathBuf::from(dir).join("omarchy-yapper.sock"))
 }
 
 fn default_data_dir() -> Result<PathBuf> {
     if let Some(d) = std::env::var_os("XDG_DATA_HOME") {
-        return Ok(PathBuf::from(d).join("omarchy-chatd"));
+        return Ok(PathBuf::from(d).join("omarchy-yapperd"));
     }
     let home = std::env::var_os("HOME").context("HOME is not set")?;
-    Ok(PathBuf::from(home).join(".local/share/omarchy-chatd"))
+    Ok(PathBuf::from(home).join(".local/share/omarchy-yapperd"))
 }
 
 #[tokio::main]
@@ -72,7 +72,7 @@ async fn main() -> Result<()> {
     // A live daemon answers on the socket; a dead one leaves a stale file.
     if socket.exists() {
         if UnixStream::connect(&socket).await.is_ok() {
-            bail!("another omarchy-chatd is already listening on {}", socket.display());
+            bail!("another omarchy-yapperd is already listening on {}", socket.display());
         }
         std::fs::remove_file(&socket)?;
     }

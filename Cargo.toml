@@ -1,14 +1,14 @@
 [package]
-name = "omarchy-chatd"
+name = "omarchy-yapperd"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.96"
 license = "MIT"
-description = "End-to-end encrypted Matrix daemon behind the Omarchy chat plugin"
-repository = "https://github.com/marcho78/omarchy-chatd"
+description = "End-to-end encrypted Matrix daemon behind the Yapper plugin"
+repository = "https://github.com/marcho78/omarchy-yapperd"
 
 [[bin]]
-name = "omarchy-chatd"
+name = "omarchy-yapperd"
 path = "src/main.rs"
 
 [dependencies]
