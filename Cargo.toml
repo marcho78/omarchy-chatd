@@ -16,12 +16,14 @@ anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 libc = "0.2"
 # Default features: e2e-encryption, automatic-room-key-forwarding, sqlite, rustls.
-matrix-sdk = "0.19"
+# local-server: loopback HTTP listener for the OAuth redirect.
+matrix-sdk = { version = "0.19", features = ["local-server"] }
 rand = "0.10"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "io-util", "sync", "signal", "fs"] }
 tracing = "0.1"
+url = "2"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [profile.release]

@@ -28,6 +28,12 @@ pub enum Command {
         username: String,
         password: String,
     },
+    /// Browser sign-in (OAuth 2.0 / OIDC, e.g. matrix.org accounts made with
+    /// Google or GitHub). Returns `{url}` to open; login completes in the
+    /// background and is announced by a `state` event.
+    LoginOauth { homeserver: String },
+    /// Abandon a browser sign-in that has not completed.
+    LoginCancel,
     /// Invalidate the access token and wipe the local store.
     Logout,
     /// Joined rooms with names, encryption flag and unread counts.
@@ -81,6 +87,8 @@ pub struct Status {
     pub version: &'static str,
     pub logged_in: bool,
     pub syncing: bool,
+    /// A browser sign-in is waiting for the redirect.
+    pub pending_login: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub user_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

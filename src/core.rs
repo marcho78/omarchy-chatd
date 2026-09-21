@@ -5,15 +5,23 @@
 use std::{
     fs::OpenOptions,
     io::Write,
+    net::{Ipv4Addr, Ipv6Addr},
     os::unix::fs::{DirBuilderExt, OpenOptionsExt},
     path::{Path, PathBuf},
     sync::Arc,
+    time::Duration,
 };
 
 use anyhow::{Context, Result, anyhow, bail};
 use matrix_sdk::{
-    Client, LoopCtrl, Room, RoomState,
-    authentication::matrix::MatrixSession,
+    Client, LoopCtrl, Room, RoomState, SessionChange,
+    authentication::{
+        matrix::MatrixSession,
+        oauth::{
+            ClientId, OAuthAuthorizationData, OAuthSession, UserSession,
+            registration::{ApplicationType, ClientMetadata, Localized, OAuthGrantType},
+        },
+    },
     config::SyncSettings,
     deserialized_responses::EncryptionInfo,
     event_handler::Ctx,
@@ -26,18 +34,24 @@ use matrix_sdk::{
             receipt::ReceiptThread,
             room::message::{OriginalSyncRoomMessageEvent, RoomMessageEventContent},
         },
+        serde::Raw,
     },
+    utils::local_server::LocalServerBuilder,
 };
 use rand::{RngExt, distr::Alphanumeric, rng};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::{sync::broadcast, task::JoinHandle};
 use tracing::{info, warn};
+use url::Url;
 
 use crate::protocol::{Command, Event, Message, Request, Response, RoomInfo, Status};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 const DEVICE_NAME: &str = "Omarchy Chat";
+const CLIENT_URI: &str = "https://github.com/marcho78/omarchy-chat";
+/// How long a browser sign-in may sit waiting for the redirect.
+const OAUTH_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 
 /// What survives a restart. Written to `<data_dir>/session.json` with mode
 /// 0600. The store passphrase is random and only ever lives here; the user's
@@ -47,17 +61,39 @@ struct PersistedSession {
     homeserver: String,
     store_path: PathBuf,
     store_passphrase: String,
-    user_session: MatrixSession,
+    auth: StoredAuth,
     #[serde(skip_serializing_if = "Option::is_none")]
     sync_token: Option<String>,
+}
+
+/// The two ways a session can have been obtained. OAuth sessions carry a
+/// refresh token and the client id registered with the homeserver.
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum StoredAuth {
+    Password { session: MatrixSession },
+    Oauth { client_id: ClientId, user: UserSession },
+}
+
+/// A browser sign-in that is waiting for the redirect.
+struct PendingLogin {
+    task: JoinHandle<()>,
+    store_path: PathBuf,
 }
 
 #[derive(Default)]
 struct State {
     client: Option<Client>,
     sync_task: Option<JoinHandle<()>>,
+    pending: Option<PendingLogin>,
     syncing: bool,
     error: Option<String>,
+}
+
+impl State {
+    fn login_pending(&self) -> bool {
+        self.pending.as_ref().is_some_and(|p| !p.task.is_finished())
+    }
 }
 
 pub struct Core {
@@ -99,10 +135,16 @@ impl Core {
         let saved: PersistedSession = serde_json::from_str(&text)?;
         let client = Client::builder()
             .homeserver_url(&saved.homeserver)
+            .handle_refresh_tokens()
             .sqlite_store(&saved.store_path, Some(&saved.store_passphrase))
             .build()
             .await?;
-        client.restore_session(saved.user_session).await?;
+        match saved.auth {
+            StoredAuth::Password { session } => client.restore_session(session).await?,
+            StoredAuth::Oauth { client_id, user } => {
+                client.restore_session(OAuthSession { client_id, user }).await?
+            }
+        }
         info!(user = %client.user_id().map(|u| u.to_string()).unwrap_or_default(), "session restored");
         self.start(client, saved.sync_token).await;
         Ok(())
@@ -127,6 +169,14 @@ impl Core {
             Command::Status => Ok(serde_json::to_value(self.status().await)?),
             Command::Login { homeserver, username, password } => {
                 self.login(homeserver, username, password).await?;
+                Ok(serde_json::to_value(self.status().await)?)
+            }
+            Command::LoginOauth { homeserver } => {
+                let url = self.login_oauth(homeserver).await?;
+                Ok(json!({ "url": url }))
+            }
+            Command::LoginCancel => {
+                self.login_cancel().await?;
                 Ok(serde_json::to_value(self.status().await)?)
             }
             Command::Logout => {
@@ -156,6 +206,7 @@ impl Core {
             version: VERSION,
             logged_in: st.client.is_some(),
             syncing: st.syncing,
+            pending_login: st.login_pending(),
             user_id: st.client.as_ref().and_then(|c| c.user_id().map(|u| u.to_string())),
             homeserver: st.client.as_ref().map(|c| c.homeserver().to_string()),
             error: st.error.clone(),
@@ -177,10 +228,9 @@ impl Core {
 
     // ---------- login / logout ----------
 
-    async fn login(self: &Arc<Self>, homeserver: String, username: String, password: String) -> Result<()> {
-        if self.state.lock().await.client.is_some() {
-            bail!("already logged in; log out first");
-        }
+    /// Build a client with a fresh encrypted store. Returns the store path
+    /// and passphrase so the caller can persist or discard them.
+    async fn build_client(&self, homeserver: &str) -> Result<(Client, PathBuf, String)> {
         // ThreadRng is !Send, so it must not live across an await.
         let (store_name, store_passphrase) = {
             let mut r = rng();
@@ -189,23 +239,48 @@ impl Core {
             (name, pass)
         };
         let store_path = self.data_dir.join(format!("store-{store_name}"));
-
         let client = Client::builder()
-            .homeserver_url(&homeserver)
+            .server_name_or_homeserver_url(homeserver)
+            .handle_refresh_tokens()
             .sqlite_store(&store_path, Some(&store_passphrase))
             .build()
-            .await
-            .context("connecting to homeserver")?;
+            .await;
+        match client {
+            Ok(client) => Ok((client, store_path, store_passphrase)),
+            Err(e) => {
+                let _ = std::fs::remove_dir_all(&store_path);
+                Err(e).context("connecting to homeserver")
+            }
+        }
+    }
 
-        client
+    async fn ensure_signed_out(&self) -> Result<()> {
+        let st = self.state.lock().await;
+        if st.client.is_some() {
+            bail!("already logged in; log out first");
+        }
+        if st.login_pending() {
+            bail!("a browser sign-in is already in progress; cancel it first");
+        }
+        Ok(())
+    }
+
+    async fn login(self: &Arc<Self>, homeserver: String, username: String, password: String) -> Result<()> {
+        self.ensure_signed_out().await?;
+        let (client, store_path, store_passphrase) = self.build_client(&homeserver).await?;
+
+        let login = client
             .matrix_auth()
             .login_username(&username, &password)
             .initial_device_display_name(DEVICE_NAME)
-            .await
-            .context("login")?;
+            .await;
         drop(password);
+        if let Err(e) = login {
+            let _ = std::fs::remove_dir_all(&store_path);
+            return Err(e).context("login");
+        }
 
-        let user_session = client
+        let session = client
             .matrix_auth()
             .session()
             .ok_or_else(|| anyhow!("login succeeded but no session was returned"))?;
@@ -213,22 +288,116 @@ impl Core {
             homeserver: client.homeserver().to_string(),
             store_path,
             store_passphrase,
-            user_session,
+            auth: StoredAuth::Password { session },
             sync_token: None,
         };
         write_private(&self.session_file(), &serde_json::to_vec(&saved)?)?;
-        info!(user = %username, "logged in");
+        info!(user = %username, "logged in with password");
         self.start(client, None).await;
         Ok(())
     }
 
+    /// Start a browser sign-in. Returns the URL to open; a background task
+    /// waits for the redirect on a loopback listener and finishes the login.
+    async fn login_oauth(self: &Arc<Self>, homeserver: String) -> Result<String> {
+        self.ensure_signed_out().await?;
+        let (client, store_path, store_passphrase) = self.build_client(&homeserver).await?;
+
+        let oauth = client.oauth();
+        if let Err(e) = oauth.server_metadata().await {
+            let _ = std::fs::remove_dir_all(&store_path);
+            if e.is_not_supported() {
+                bail!("this homeserver does not support browser sign-in; use a password instead");
+            }
+            return Err(e).context("fetching the homeserver's OAuth metadata");
+        }
+
+        let (redirect_uri, redirect) = match LocalServerBuilder::new().spawn().await {
+            Ok(v) => v,
+            Err(e) => {
+                let _ = std::fs::remove_dir_all(&store_path);
+                return Err(e).context("starting the local redirect listener");
+            }
+        };
+        let auth = oauth
+            .login(redirect_uri, None, Some(client_metadata().into()), None)
+            .build()
+            .await;
+        let OAuthAuthorizationData { url, .. } = match auth {
+            Ok(v) => v,
+            Err(e) => {
+                let _ = std::fs::remove_dir_all(&store_path);
+                return Err(e).context("starting browser sign-in");
+            }
+        };
+
+        let core = self.clone();
+        let task_store = store_path.clone();
+        let task = tokio::spawn(async move {
+            let outcome: Result<()> = async {
+                let query = match tokio::time::timeout(OAUTH_TIMEOUT, redirect).await {
+                    Err(_) => bail!("browser sign-in timed out"),
+                    Ok(None) => bail!("the browser returned without sign-in data"),
+                    Ok(Some(q)) => q,
+                };
+                client.oauth().finish_login(query.into()).await.context("finishing browser sign-in")?;
+                let full = client
+                    .oauth()
+                    .full_session()
+                    .ok_or_else(|| anyhow!("sign-in succeeded but no session was returned"))?;
+                let saved = PersistedSession {
+                    homeserver: client.homeserver().to_string(),
+                    store_path: task_store.clone(),
+                    store_passphrase: store_passphrase.clone(),
+                    auth: StoredAuth::Oauth { client_id: full.client_id, user: full.user },
+                    sync_token: None,
+                };
+                write_private(&core.session_file(), &serde_json::to_vec(&saved)?)?;
+                Ok(())
+            }
+            .await;
+            match outcome {
+                Ok(()) => {
+                    info!(user = %client.user_id().map(|u| u.to_string()).unwrap_or_default(), "logged in via browser");
+                    core.start(client, None).await;
+                }
+                Err(e) => {
+                    warn!("browser sign-in failed: {e:#}");
+                    let _ = std::fs::remove_dir_all(&task_store);
+                    core.set_error(Some(format!("{e:#}"))).await;
+                }
+            }
+        });
+
+        self.state.lock().await.pending = Some(PendingLogin { task, store_path });
+        self.broadcast_state().await;
+        Ok(url.to_string())
+    }
+
+    async fn login_cancel(&self) -> Result<()> {
+        let pending = self.state.lock().await.pending.take();
+        let Some(p) = pending else { bail!("no browser sign-in in progress") };
+        if p.task.is_finished() {
+            return Ok(());
+        }
+        p.task.abort();
+        let _ = std::fs::remove_dir_all(&p.store_path);
+        info!("browser sign-in cancelled");
+        self.broadcast_state().await;
+        Ok(())
+    }
+
     async fn logout(self: &Arc<Self>) -> Result<()> {
-        let (client, task) = {
+        let (client, task, pending) = {
             let mut st = self.state.lock().await;
-            (st.client.take(), st.sync_task.take())
+            (st.client.take(), st.sync_task.take(), st.pending.take())
         };
         if let Some(task) = task {
             task.abort();
+        }
+        if let Some(p) = pending {
+            p.task.abort();
+            let _ = std::fs::remove_dir_all(&p.store_path);
         }
         let Some(client) = client else { bail!("not logged in") };
         if let Err(e) = client.logout().await {
@@ -262,12 +431,50 @@ impl Core {
         let sync_client = client.clone();
         let task = tokio::spawn(async move { core.sync_loop(sync_client, sync_token).await });
 
+        // OAuth access tokens are short-lived; the SDK refreshes them and we
+        // must persist the new pair or the next restart is signed out.
+        let core = self.clone();
+        let watch_client = client.clone();
+        let mut changes = client.subscribe_to_session_changes();
+        tokio::spawn(async move {
+            while let Ok(change) = changes.recv().await {
+                match change {
+                    SessionChange::TokensRefreshed => {
+                        if let Err(e) = core.persist_tokens(&watch_client) {
+                            warn!("could not persist refreshed tokens: {e:#}");
+                        }
+                    }
+                    SessionChange::UnknownToken(info) => {
+                        warn!(soft_logout = info.soft_logout, "homeserver rejected our token");
+                        core.set_error(Some("session expired; sign out and sign in again".into())).await;
+                    }
+                }
+            }
+        });
+
         let mut st = self.state.lock().await;
         st.client = Some(client);
         st.sync_task = Some(task);
+        st.pending = None;
         st.error = None;
         drop(st);
         self.broadcast_state().await;
+    }
+
+    fn persist_tokens(&self, client: &Client) -> Result<()> {
+        let file = self.session_file();
+        let text = std::fs::read_to_string(&file)?;
+        let mut saved: PersistedSession = serde_json::from_str(&text)?;
+        saved.auth = match saved.auth {
+            StoredAuth::Password { .. } => StoredAuth::Password {
+                session: client.matrix_auth().session().ok_or_else(|| anyhow!("no session"))?,
+            },
+            StoredAuth::Oauth { client_id, .. } => StoredAuth::Oauth {
+                client_id,
+                user: client.oauth().user_session().ok_or_else(|| anyhow!("no session"))?,
+            },
+        };
+        write_private(&file, &serde_json::to_vec(&saved)?)
     }
 
     async fn sync_loop(self: Arc<Self>, client: Client, initial_token: Option<String>) {
@@ -404,6 +611,25 @@ impl Core {
             .context("sending read receipt")?;
         Ok(())
     }
+}
+
+/// How this daemon introduces itself to the homeserver's OAuth server when
+/// registering dynamically. Redirects go to a loopback listener.
+fn client_metadata() -> Raw<ClientMetadata> {
+    let v4 = Url::parse(&format!("http://{}/", Ipv4Addr::LOCALHOST)).expect("valid redirect URI");
+    let v6 = Url::parse(&format!("http://[{}]/", Ipv6Addr::LOCALHOST)).expect("valid redirect URI");
+    let client_uri = Localized::new(Url::parse(CLIENT_URI).expect("valid client URI"), None);
+    let metadata = ClientMetadata {
+        client_name: Some(Localized::new(DEVICE_NAME.to_owned(), [])),
+        policy_uri: Some(client_uri.clone()),
+        tos_uri: Some(client_uri.clone()),
+        ..ClientMetadata::new(
+            ApplicationType::Native,
+            vec![OAuthGrantType::AuthorizationCode { redirect_uris: vec![v4, v6] }],
+            client_uri,
+        )
+    };
+    Raw::new(&metadata).expect("client metadata serializes")
 }
 
 /// Event handler registered on the client: forwards every incoming room
