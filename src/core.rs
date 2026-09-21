@@ -1020,6 +1020,8 @@ impl Core {
                     reactions: Vec::new(),
                     read_by: Vec::new(),
                     deleted: false,
+                    notify: None,
+                    highlight: None,
                 })
             }
             // A redacted message keeps its place with empty content — in an
@@ -1056,6 +1058,8 @@ impl Core {
                     reactions: Vec::new(),
                     read_by: Vec::new(),
                     deleted: false,
+                    notify: None,
+                    highlight: None,
                 })
             }
             _ => None,
@@ -1133,11 +1137,16 @@ async fn on_room_message(
     event: OriginalSyncRoomMessageEvent,
     room: Room,
     encryption: Option<EncryptionInfo>,
+    actions: Vec<matrix_sdk::ruma::push::Action>,
     ctx: Ctx<HandlerCtx>,
 ) {
     if room.state() != RoomState::Joined {
         return;
     }
+    // The SDK evaluates the account's push rules for every event; muted
+    // rooms, mentions and keyword rules all land here.
+    let notify = Some(actions.iter().any(|a| a.should_notify()));
+    let highlight = Some(actions.iter().any(|a| a.is_highlight()));
     if let Some(Relation::Replacement(Replacement { event_id, new_content, .. })) = &event.content.relates_to {
         let html = formatted_html(&new_content.msgtype);
         let _ = ctx.events.send(Event::MessageEdited(MessageEdit {
@@ -1148,7 +1157,9 @@ async fn on_room_message(
         }));
         return;
     }
-    let msg = to_message(&room, event, encryption.is_some()).await;
+    let mut msg = to_message(&room, event, encryption.is_some()).await;
+    msg.notify = notify;
+    msg.highlight = highlight;
     let _ = ctx.events.send(Event::Message(msg));
 }
 
@@ -1261,6 +1272,8 @@ async fn to_message(room: &Room, ev: OriginalSyncRoomMessageEvent, encrypted: bo
         reactions: Vec::new(),
         read_by: Vec::new(),
         deleted: false,
+        notify: None,
+        highlight: None,
     }
 }
 
@@ -1292,6 +1305,8 @@ async fn deleted_placeholder(
         reactions: Vec::new(),
         read_by: Vec::new(),
         deleted: true,
+        notify: None,
+        highlight: None,
     }
 }
 

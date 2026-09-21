@@ -385,6 +385,13 @@ pub struct Message {
     pub read_by: Vec<UserRef>,
     /// True when the message was deleted (redacted).
     pub deleted: bool,
+    /// What the account's push rules say about this event: whether it
+    /// should notify at all, and whether it is a highlight (mention,
+    /// keyword). Live messages only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub notify: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub highlight: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize)]

@@ -135,7 +135,8 @@ A `message` is `{room, event_id, sender, sender_name, body, html?, msgtype, ts, 
 — `reply_to` is `{event_id, sender, sender_name, body}`; an edited message carries its latest
 text; `reactions` is `[{key, count, senders: [{id, name, reaction_id}], mine?}]`; `read_by`
 lists others whose read receipt points here; a deleted message keeps its place with `deleted: true`.
-Rooms and senders carry `avatar` / `sender_avatar` mxc URLs. Membership changes come as
+Rooms and senders carry `avatar` / `sender_avatar` mxc URLs. Live messages carry the
+push-rule verdict as `notify` and `highlight`; rooms carry `notification_mode`. Membership changes come as
 `msgtype: "system"` messages whose body is the line to show ("X joined").
 — `attachment` is `{kind, name, caption?, mime?, size?, width?, height?, has_thumbnail}` for
 `m.image`, `m.file`, `m.video` and `m.audio`
@@ -207,7 +208,7 @@ package builds `--frozen`.
 
 ## Roadmap
 
-1. Push-rule-aware notifications, click to open (Tier 2).
+1. Spaces, favourites, sort (Tier 2).
 3. **Keyring** — store passphrase in the Secret Service instead of `session.json`.
 
 ## License
