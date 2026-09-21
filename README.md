@@ -101,20 +101,21 @@ the response echoes.
 | `logout` | | status |
 | `rooms` | | `[{id, name, topic?, encrypted, direct, unread, highlights, notifications, read_marker?}]`, unread first — `unread` is the local count since our receipt, `notifications` the server's |
 | `timeline` | `room`, `limit` (default 50, max 200), `before?` | `{messages, next?}` — oldest first; pass `next` as `before` for the page before; no `next` at the start of history |
-| `send` | `room`, `body`, `reply_to?` | `{event_id}` |
+| `send` | `room`, `body` (CommonMark; markup becomes `formatted_body`), `reply_to?` | `{event_id}` |
 | `edit` | `room`, `event_id`, `body` | `{event_id}` — replaces one of our messages |
 | `delete` | `room`, `event_id` | `{}` — redacts one of our messages |
 | `react` / `unreact` | `room`, `event_id`, `key` / `room`, `reaction_id` | `{reaction_id}` / `{}` |
 | `typing` | `room`, `typing` | `{}` |
 | `room_details` | `room` | `{id, name, topic?, avatar?, alias?, encrypted, direct, join_rule, member_count, can_invite, can_kick, can_ban, can_set_name, can_set_topic, can_redact_other}` |
 | `members` | `room`, `query?`, `limit` | `[{id, name, avatar?, power, role}]`, most powerful first |
-| `avatar` | `url` (mxc) | `{path}` — 96px square in `~/.cache/omarchy-yapper/avatars/` |
+| `avatar` | `url` (mxc), `size?` (px, default 96, max 640) | `{path}` — square thumbnail in `~/.cache/omarchy-yapper/avatars/` |
 | `invite` / `kick` / `ban` | `room`, `user`, `reason?` | `{}` |
 | `set_name` / `set_topic` | `room`, `name` / `topic` | `{}` |
 | `set_notification_mode` | `room`, `mode` (all, mentions, mute, default) | room details |
 | `set_favourite` | `room`, `favourite` | `{}` |
 | `spaces` | | `[{id, name, avatar?, children}]` — joined spaces (excluded from `rooms`) |
 | `search` | `query`, `room?`, `limit` | `{hits: [{room, room_name, event_id, sender, sender_name, body, ts}], server_rooms, scanned_rooms, scanned_messages}` — server search for unencrypted rooms, a bounded local scan of decrypted history for encrypted ones |
+| `preview` | `url` (http/https) | `{url, title?, description?, site?, image?}` — Open Graph data fetched by the homeserver (`image` is an mxc for `avatar`) |
 | `mark_read` | `room`, `event_id` | `{}` — public read receipt and fully-read marker |
 | `search_rooms` | `query`, `server?`, `limit` | `[{id, name, alias?, topic?, members, joined}]` |
 | `join` | `room` (alias or id) | room info |
@@ -212,8 +213,10 @@ package builds `--frozen`.
 
 ## Roadmap
 
-1. Composer niceties: link previews, emoji picker, markdown (Tier 2).
-3. **Keyring** — store passphrase in the Secret Service instead of `session.json`.
+1. **Threads** — `m.thread` relations and a thread view.
+2. **Voice messages / calls** — audio attachments and Element Call links.
+3. **Multiple accounts** — one daemon, several sessions.
+4. **Keyring** — store passphrase in the Secret Service instead of `session.json`.
 
 ## License
 

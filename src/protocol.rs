@@ -31,7 +31,9 @@ pub enum Command {
     /// Browser sign-in (OAuth 2.0 / OIDC, e.g. matrix.org accounts made with
     /// Google or GitHub). Returns `{url}` to open; login completes in the
     /// background and is announced by a `state` event.
-    LoginOauth { homeserver: String },
+    LoginOauth {
+        homeserver: String,
+    },
     /// Abandon a browser sign-in that has not completed.
     LoginCancel,
     /// Invalidate the access token and wipe the local store.
@@ -57,17 +59,36 @@ pub enum Command {
         reply_to: Option<String>,
     },
     /// Replace the text of one of our own messages.
-    Edit { room: String, event_id: String, body: String },
+    Edit {
+        room: String,
+        event_id: String,
+        body: String,
+    },
     /// Remove one of our own messages (a redaction).
-    Delete { room: String, event_id: String },
+    Delete {
+        room: String,
+        event_id: String,
+    },
     /// Add an emoji reaction to a message.
-    React { room: String, event_id: String, key: String },
+    React {
+        room: String,
+        event_id: String,
+        key: String,
+    },
     /// Remove our reaction (its own event id, from the aggregate).
-    Unreact { room: String, reaction_id: String },
+    Unreact {
+        room: String,
+        reaction_id: String,
+    },
     /// Tell the room we are typing (or stopped).
-    Typing { room: String, typing: bool },
+    Typing {
+        room: String,
+        typing: bool,
+    },
     /// Details for a room's info panel.
-    RoomDetails { room: String },
+    RoomDetails {
+        room: String,
+    },
     /// Joined members, optionally filtered by name, most powerful first.
     Members {
         room: String,
@@ -78,23 +99,58 @@ pub enum Command {
     },
     /// Fetch an avatar (a user's or a room's mxc:// URL) into the media cache
     /// as a small square; returns `{path}`.
-    Avatar { url: String },
+    /// Cached thumbnail of an mxc URL; `size` (px, default 96, max 640) picks
+    /// the server-side thumbnail edge. Used for avatars and preview images.
+    Avatar {
+        url: String,
+        #[serde(default)]
+        size: Option<u32>,
+    },
     /// Invite a user to a room.
-    Invite { room: String, user: String },
+    Invite {
+        room: String,
+        user: String,
+    },
     /// Remove a user from a room (they may rejoin).
-    Kick { room: String, user: String, #[serde(default)] reason: Option<String> },
+    Kick {
+        room: String,
+        user: String,
+        #[serde(default)]
+        reason: Option<String>,
+    },
     /// Ban a user from a room.
-    Ban { room: String, user: String, #[serde(default)] reason: Option<String> },
+    Ban {
+        room: String,
+        user: String,
+        #[serde(default)]
+        reason: Option<String>,
+    },
     /// Rename a room.
-    SetName { room: String, name: String },
+    SetName {
+        room: String,
+        name: String,
+    },
     /// Change a room's topic.
-    SetTopic { room: String, topic: String },
+    SetTopic {
+        room: String,
+        topic: String,
+    },
     /// Per-room notification mode: all | mentions | mute | default.
-    SetNotificationMode { room: String, mode: String },
+    SetNotificationMode {
+        room: String,
+        mode: String,
+    },
     /// Star / unstar a room.
-    SetFavourite { room: String, favourite: bool },
+    SetFavourite {
+        room: String,
+        favourite: bool,
+    },
     /// Joined spaces with the rooms they contain.
     Spaces,
+    /// Open Graph preview of a link, fetched by the homeserver.
+    Preview {
+        url: String,
+    },
     /// Search messages: the server for unencrypted rooms, a bounded local
     /// scan for encrypted ones. `room` limits to one room.
     Search {
@@ -106,7 +162,10 @@ pub enum Command {
     },
     /// Mark the room read up to the given event: public read receipt plus
     /// the fully-read marker, so every client and device agrees.
-    MarkRead { room: String, event_id: String },
+    MarkRead {
+        room: String,
+        event_id: String,
+    },
     /// Search a server's public room directory (our own homeserver unless
     /// `server` names another).
     SearchRooms {
@@ -117,7 +176,9 @@ pub enum Command {
         limit: u32,
     },
     /// Join a room by `#alias:server` or `!id:server`.
-    Join { room: String },
+    Join {
+        room: String,
+    },
     /// Search the user directory.
     SearchUsers {
         query: String,
@@ -126,7 +187,9 @@ pub enum Command {
     },
     /// Open a direct chat with a user: the existing DM if there is one,
     /// otherwise a new encrypted one.
-    Dm { user: String },
+    Dm {
+        user: String,
+    },
     /// Create a room. Encrypted and private unless told otherwise.
     CreateRoom {
         name: String,
@@ -145,13 +208,21 @@ pub enum Command {
     /// arrives as `verification` events keyed by `flow_id`.
     VerifyRequest,
     /// Accept an incoming request (from another of our devices or a user).
-    VerifyAccept { flow_id: String },
+    VerifyAccept {
+        flow_id: String,
+    },
     /// The emoji matched on both sides.
-    VerifyConfirm { flow_id: String },
+    VerifyConfirm {
+        flow_id: String,
+    },
     /// They did not match, or the user gave up.
-    VerifyCancel { flow_id: String },
+    VerifyCancel {
+        flow_id: String,
+    },
     /// Restore cross-signing and backup secrets with the recovery key.
-    Recover { key: String },
+    Recover {
+        key: String,
+    },
     /// First device: set up cross-signing, secret storage and backup.
     /// Returns the recovery key, shown once.
     SetupRecovery,
@@ -173,9 +244,15 @@ pub enum Command {
         #[serde(default)]
         caption: Option<String>,
     },
-    AcceptInvite { room: String },
-    DeclineInvite { room: String },
-    Leave { room: String },
+    AcceptInvite {
+        room: String,
+    },
+    DeclineInvite {
+        room: String,
+    },
+    Leave {
+        room: String,
+    },
 }
 
 fn default_limit() -> u32 {
@@ -210,10 +287,20 @@ pub struct Response {
 
 impl Response {
     pub fn ok(id: Value, result: Value) -> Self {
-        Self { id, ok: true, result: Some(result), error: None }
+        Self {
+            id,
+            ok: true,
+            result: Some(result),
+            error: None,
+        }
     }
     pub fn err(id: Value, error: impl ToString) -> Self {
-        Self { id, ok: false, result: None, error: Some(error.to_string()) }
+        Self {
+            id,
+            ok: false,
+            result: None,
+            error: Some(error.to_string()),
+        }
     }
 }
 
@@ -470,6 +557,20 @@ pub struct ReceiptInfo {
     /// Users whose read receipt moved, and the event it now points at.
     pub event_id: String,
     pub users: Vec<UserRef>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct LinkPreview {
+    pub url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub site: Option<String>,
+    /// mxc:// of the preview image, fetchable with `avatar`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]

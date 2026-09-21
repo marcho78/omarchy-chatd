@@ -15,7 +15,8 @@ use matrix_sdk::{
         backups::BackupState,
         recovery::RecoveryState,
         verification::{
-            Emoji, SasState, SasVerification, Verification, VerificationRequest, VerificationRequestState,
+            Emoji, SasState, SasVerification, Verification, VerificationRequest,
+            VerificationRequestState,
         },
     },
     ruma::{
@@ -39,16 +40,22 @@ use crate::{
 /// in-room (other users, in a DM).
 pub fn install_handlers(core: &Arc<Core>, client: &Client) {
     let c = core.clone();
-    client.add_event_handler(move |ev: ToDeviceKeyVerificationRequestEvent, client: Client| {
-        let core = c.clone();
-        async move {
-            let flow_id = ev.content.transaction_id.to_string();
-            match client.encryption().get_verification_request(&ev.sender, &ev.content.transaction_id).await {
-                Some(request) => core.track_request(request, false).await,
-                None => warn!(%flow_id, "verification request without an object"),
+    client.add_event_handler(
+        move |ev: ToDeviceKeyVerificationRequestEvent, client: Client| {
+            let core = c.clone();
+            async move {
+                let flow_id = ev.content.transaction_id.to_string();
+                match client
+                    .encryption()
+                    .get_verification_request(&ev.sender, &ev.content.transaction_id)
+                    .await
+                {
+                    Some(request) => core.track_request(request, false).await,
+                    None => warn!(%flow_id, "verification request without an object"),
+                }
             }
-        }
-    });
+        },
+    );
     let c = core.clone();
     client.add_event_handler(move |ev: OriginalSyncRoomMessageEvent, client: Client| {
         let core = c.clone();
@@ -56,7 +63,11 @@ pub fn install_handlers(core: &Arc<Core>, client: &Client) {
             if !matches!(ev.content.msgtype, MessageType::VerificationRequest(_)) {
                 return;
             }
-            match client.encryption().get_verification_request(&ev.sender, &ev.event_id).await {
+            match client
+                .encryption()
+                .get_verification_request(&ev.sender, &ev.event_id)
+                .await
+            {
                 Some(request) => core.track_request(request, false).await,
                 None => warn!(event = %ev.event_id, "room verification request without an object"),
             }
@@ -71,11 +82,21 @@ impl Core {
         let client = self.client().await?;
         let enc = client.encryption();
         let me = client.user_id().ok_or_else(|| anyhow!("no user id"))?;
-        let own_device_id = client.device_id().map(|d| d.to_string()).unwrap_or_default();
+        let own_device_id = client
+            .device_id()
+            .map(|d| d.to_string())
+            .unwrap_or_default();
 
         let own = enc.get_own_device().await.ok().flatten();
-        let device_verified = own.as_ref().map(|d| d.is_cross_signed_by_owner()).unwrap_or(false);
-        let cross_signing = enc.cross_signing_status().await.map(|s| s.has_master).unwrap_or(false);
+        let device_verified = own
+            .as_ref()
+            .map(|d| d.is_cross_signed_by_owner())
+            .unwrap_or(false);
+        let cross_signing = enc
+            .cross_signing_status()
+            .await
+            .map(|s| s.has_master)
+            .unwrap_or(false);
 
         let mut other_devices = Vec::new();
         if let Ok(devices) = enc.get_user_devices(me).await {
@@ -128,7 +149,10 @@ impl Core {
             .await
             .context("looking up our identity")?
             .ok_or_else(|| anyhow!("this account has no cross-signing identity yet; set up recovery first or verify from a device that has it"))?;
-        let request = identity.request_verification().await.context("sending verification request")?;
+        let request = identity
+            .request_verification()
+            .await
+            .context("sending verification request")?;
         let flow_id = request.flow_id().to_owned();
         info!(%flow_id, "verification requested from our other devices");
         self.track_request(request, true).await;
@@ -137,7 +161,13 @@ impl Core {
 
     async fn request_by_id(&self, flow_id: &str) -> Result<(Client, VerificationRequest)> {
         let client = self.client().await?;
-        let user = self.flows.lock().await.get(flow_id).cloned().ok_or_else(|| anyhow!("unknown verification {flow_id}"))?;
+        let user = self
+            .flows
+            .lock()
+            .await
+            .get(flow_id)
+            .cloned()
+            .ok_or_else(|| anyhow!("unknown verification {flow_id}"))?;
         let req = client
             .encryption()
             .get_verification_request(&user, flow_id)
@@ -148,7 +178,13 @@ impl Core {
 
     async fn sas_by_id(&self, flow_id: &str) -> Result<SasVerification> {
         let client = self.client().await?;
-        let user = self.flows.lock().await.get(flow_id).cloned().ok_or_else(|| anyhow!("unknown verification {flow_id}"))?;
+        let user = self
+            .flows
+            .lock()
+            .await
+            .get(flow_id)
+            .cloned()
+            .ok_or_else(|| anyhow!("unknown verification {flow_id}"))?;
         match client.encryption().get_verification(&user, flow_id).await {
             Some(Verification::SasV1(sas)) => Ok(sas),
             _ => bail!("verification {flow_id} has no emoji exchange yet"),
@@ -187,7 +223,10 @@ impl Core {
     async fn track_request(self: &Arc<Self>, request: VerificationRequest, outgoing: bool) {
         let flow_id = request.flow_id().to_owned();
         let other: OwnedUserId = request.other_user_id().to_owned();
-        self.flows.lock().await.insert(flow_id.clone(), other.clone());
+        self.flows
+            .lock()
+            .await
+            .insert(flow_id.clone(), other.clone());
         self.emit(&request, outgoing, "requested", Vec::new(), None);
 
         let core = self.clone();
@@ -195,7 +234,8 @@ impl Core {
             let mut changes = request.changes();
             while let Some(state) = changes.next().await {
                 match state {
-                    VerificationRequestState::Created { .. } | VerificationRequestState::Requested { .. } => {}
+                    VerificationRequestState::Created { .. }
+                    | VerificationRequestState::Requested { .. } => {}
                     VerificationRequestState::Ready { .. } => {
                         core.emit(&request, outgoing, "ready", Vec::new(), None);
                         // Whoever is ready first starts the emoji exchange;
@@ -215,7 +255,13 @@ impl Core {
                         break;
                     }
                     VerificationRequestState::Cancelled(info) => {
-                        core.emit(&request, outgoing, "cancelled", Vec::new(), Some(info.reason().to_owned()));
+                        core.emit(
+                            &request,
+                            outgoing,
+                            "cancelled",
+                            Vec::new(),
+                            Some(info.reason().to_owned()),
+                        );
                         break;
                     }
                 }
@@ -224,7 +270,12 @@ impl Core {
         });
     }
 
-    fn track_sas(self: &Arc<Self>, request: VerificationRequest, sas: SasVerification, outgoing: bool) {
+    fn track_sas(
+        self: &Arc<Self>,
+        request: VerificationRequest,
+        sas: SasVerification,
+        outgoing: bool,
+    ) {
         let core = self.clone();
         tokio::spawn(async move {
             if !sas.we_started() {
@@ -241,7 +292,9 @@ impl Core {
                             .unwrap_or_default();
                         core.emit_sas(&request, &sas, outgoing, "emoji", list, None);
                     }
-                    SasState::Confirmed => core.emit(&request, outgoing, "confirmed", Vec::new(), None),
+                    SasState::Confirmed => {
+                        core.emit(&request, outgoing, "confirmed", Vec::new(), None)
+                    }
                     SasState::Done { .. } => {
                         info!(device = %sas.other_device().device_id(), "device verified");
                         core.emit(&request, outgoing, "done", Vec::new(), None);
@@ -249,16 +302,32 @@ impl Core {
                         break;
                     }
                     SasState::Cancelled(info) => {
-                        core.emit(&request, outgoing, "cancelled", Vec::new(), Some(info.reason().to_owned()));
+                        core.emit(
+                            &request,
+                            outgoing,
+                            "cancelled",
+                            Vec::new(),
+                            Some(info.reason().to_owned()),
+                        );
                         break;
                     }
-                    SasState::Created { .. } | SasState::Started { .. } | SasState::Accepted { .. } => {}
+                    SasState::Created { .. }
+                    | SasState::Started { .. }
+                    | SasState::Accepted { .. } => {}
                 }
             }
         });
     }
 
-    fn emit_sas(&self, request: &VerificationRequest, sas: &SasVerification, outgoing: bool, state: &str, emojis: Vec<EmojiInfo>, reason: Option<String>) {
+    fn emit_sas(
+        &self,
+        request: &VerificationRequest,
+        sas: &SasVerification,
+        outgoing: bool,
+        state: &str,
+        emojis: Vec<EmojiInfo>,
+        reason: Option<String>,
+    ) {
         let dev = sas.other_device();
         let _ = self.events().send(Event::Verification(VerificationInfo {
             flow_id: request.flow_id().to_owned(),
@@ -272,7 +341,14 @@ impl Core {
         }));
     }
 
-    fn emit(&self, request: &VerificationRequest, outgoing: bool, state: &str, emojis: Vec<EmojiInfo>, reason: Option<String>) {
+    fn emit(
+        &self,
+        request: &VerificationRequest,
+        outgoing: bool,
+        state: &str,
+        emojis: Vec<EmojiInfo>,
+        reason: Option<String>,
+    ) {
         let _ = self.events().send(Event::Verification(VerificationInfo {
             flow_id: request.flow_id().to_owned(),
             other_user: request.other_user_id().to_string(),
@@ -290,10 +366,15 @@ impl Core {
     pub(crate) async fn recover(&self, key: &str) -> Result<()> {
         let client = self.client().await?;
         let recovery = client.encryption().recovery();
-        recovery.recover(key.trim()).await.context("recovering with that key")?;
+        recovery
+            .recover(key.trim())
+            .await
+            .context("recovering with that key")?;
         match recovery.state() {
             RecoveryState::Enabled => {}
-            RecoveryState::Incomplete => bail!("recovered some secrets but not all; try again or verify with another device"),
+            RecoveryState::Incomplete => {
+                bail!("recovered some secrets but not all; try again or verify with another device")
+            }
             _ => bail!("recovery did not complete"),
         }
         let _ = self.events().send(Event::VerificationStatusChanged);
@@ -306,7 +387,11 @@ impl Core {
     pub(crate) async fn setup_recovery(&self) -> Result<String> {
         let client = self.client().await?;
         let enc = client.encryption();
-        let has_master = enc.cross_signing_status().await.map(|s| s.has_master).unwrap_or(false);
+        let has_master = enc
+            .cross_signing_status()
+            .await
+            .map(|s| s.has_master)
+            .unwrap_or(false);
         if has_master && matches!(enc.recovery().state(), RecoveryState::Enabled) {
             bail!("recovery is already set up; use the recovery key or verify with another device");
         }
@@ -322,8 +407,16 @@ impl Core {
         // identity is re-keyed so the key covers everything.
         let key = match enc.recovery().state() {
             RecoveryState::Enabled => bail!("recovery is already set up"),
-            RecoveryState::Disabled | RecoveryState::Unknown => enc.recovery().enable().await.context("setting up recovery")?,
-            RecoveryState::Incomplete => enc.recovery().reset_key().await.context("re-keying recovery")?,
+            RecoveryState::Disabled | RecoveryState::Unknown => enc
+                .recovery()
+                .enable()
+                .await
+                .context("setting up recovery")?,
+            RecoveryState::Incomplete => enc
+                .recovery()
+                .reset_key()
+                .await
+                .context("re-keying recovery")?,
         };
         let _ = self.events().send(Event::VerificationStatusChanged);
         Ok(key)
@@ -334,10 +427,19 @@ impl Core {
     pub(crate) async fn reset_recovery_key(&self) -> Result<String> {
         let client = self.client().await?;
         let enc = client.encryption();
-        if !enc.cross_signing_status().await.map(|s| s.has_master).unwrap_or(false) {
+        if !enc
+            .cross_signing_status()
+            .await
+            .map(|s| s.has_master)
+            .unwrap_or(false)
+        {
             bail!("no encryption identity yet; set up encryption first");
         }
-        let key = enc.recovery().reset_key().await.context("creating a new recovery key")?;
+        let key = enc
+            .recovery()
+            .reset_key()
+            .await
+            .context("creating a new recovery key")?;
         info!("recovery key reset");
         let _ = self.events().send(Event::VerificationStatusChanged);
         Ok(key)
@@ -345,6 +447,8 @@ impl Core {
 }
 
 fn emoji_info(e: &Emoji) -> EmojiInfo {
-    EmojiInfo { symbol: e.symbol.to_owned(), description: e.description.to_owned() }
+    EmojiInfo {
+        symbol: e.symbol.to_owned(),
+        description: e.description.to_owned(),
+    }
 }
-

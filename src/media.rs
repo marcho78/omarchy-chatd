@@ -82,11 +82,28 @@ pub fn attachment_of(msgtype: &MessageType) -> Option<Attachment> {
         }
         MessageType::Audio(c) => {
             let i = c.info.as_deref();
-            ("audio", c.filename().to_owned(), i.and_then(|i| i.mimetype.clone()), i.and_then(|i| i.size).map(u64::from), None, None, false)
+            (
+                "audio",
+                c.filename().to_owned(),
+                i.and_then(|i| i.mimetype.clone()),
+                i.and_then(|i| i.size).map(u64::from),
+                None,
+                None,
+                false,
+            )
         }
         _ => return None,
     };
-    Some(Attachment { kind: kind.to_owned(), name, caption, mime, size, width, height, has_thumbnail: thumb })
+    Some(Attachment {
+        kind: kind.to_owned(),
+        name,
+        caption,
+        mime,
+        size,
+        width,
+        height,
+        has_thumbnail: thumb,
+    })
 }
 
 fn cache_dir() -> Result<PathBuf> {
@@ -100,7 +117,10 @@ fn cache_dir() -> Result<PathBuf> {
 }
 
 pub fn avatar_cache_dir() -> Result<PathBuf> {
-    let dir = cache_dir()?.parent().unwrap_or(Path::new(".")).join("avatars");
+    let dir = cache_dir()?
+        .parent()
+        .unwrap_or(Path::new("."))
+        .join("avatars");
     std::fs::create_dir_all(&dir)?;
     Ok(dir)
 }
@@ -117,30 +137,82 @@ fn cache_name(event_id: &str, thumbnail: bool, mime: Option<&str>, filename: &st
     let ext = mime
         .and_then(mime2ext::mime2ext)
         .map(str::to_owned)
-        .or_else(|| Path::new(filename).extension().map(|e| e.to_string_lossy().into_owned()))
+        .or_else(|| {
+            Path::new(filename)
+                .extension()
+                .map(|e| e.to_string_lossy().into_owned())
+        })
         .unwrap_or_else(|| "bin".to_owned());
-    format!("{:016x}{}.{}", h.finish(), if thumbnail { "-thumb" } else { "" }, ext)
+    format!(
+        "{:016x}{}.{}",
+        h.finish(),
+        if thumbnail { "-thumb" } else { "" },
+        ext
+    )
 }
 
 impl Core {
     /// Fetch an attachment (or its thumbnail) into the cache; returns the
     /// local path and mime type. Cached files are returned without a fetch.
-    pub(crate) async fn download(&self, room_id: &str, event_id: &str, thumbnail: bool) -> Result<(String, String)> {
+    pub(crate) async fn download(
+        &self,
+        room_id: &str,
+        event_id: &str,
+        thumbnail: bool,
+    ) -> Result<(String, String)> {
         let room = self.room(room_id).await?;
         let client = self.client().await?;
         let eid = EventId::parse(event_id).context("invalid event id")?;
         let ev = room.event(&eid, None).await.context("fetching the event")?;
         let parsed: AnySyncTimelineEvent = ev.raw().deserialize().context("reading the event")?;
-        let AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::RoomMessage(SyncMessageLikeEvent::Original(msg))) = parsed
+        let AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::RoomMessage(
+            SyncMessageLikeEvent::Original(msg),
+        )) = parsed
         else {
             bail!("not a message event");
         };
 
         let (bytes, mime, name): (Vec<u8>, String, String) = match &msg.content.msgtype {
-            MessageType::Image(c) => fetch(&client, c, c.filename(), c.info.as_deref().and_then(|i| i.mimetype.clone()), thumbnail).await?,
-            MessageType::File(c) => fetch(&client, c, c.filename(), c.info.as_deref().and_then(|i| i.mimetype.clone()), thumbnail).await?,
-            MessageType::Video(c) => fetch(&client, c, c.filename(), c.info.as_deref().and_then(|i| i.mimetype.clone()), thumbnail).await?,
-            MessageType::Audio(c) => fetch(&client, c, c.filename(), c.info.as_deref().and_then(|i| i.mimetype.clone()), false).await?,
+            MessageType::Image(c) => {
+                fetch(
+                    &client,
+                    c,
+                    c.filename(),
+                    c.info.as_deref().and_then(|i| i.mimetype.clone()),
+                    thumbnail,
+                )
+                .await?
+            }
+            MessageType::File(c) => {
+                fetch(
+                    &client,
+                    c,
+                    c.filename(),
+                    c.info.as_deref().and_then(|i| i.mimetype.clone()),
+                    thumbnail,
+                )
+                .await?
+            }
+            MessageType::Video(c) => {
+                fetch(
+                    &client,
+                    c,
+                    c.filename(),
+                    c.info.as_deref().and_then(|i| i.mimetype.clone()),
+                    thumbnail,
+                )
+                .await?
+            }
+            MessageType::Audio(c) => {
+                fetch(
+                    &client,
+                    c,
+                    c.filename(),
+                    c.info.as_deref().and_then(|i| i.mimetype.clone()),
+                    false,
+                )
+                .await?
+            }
             _ => bail!("this message has no attachment"),
         };
 
@@ -153,10 +225,16 @@ impl Core {
 
     /// Upload a local file. Images get their dimensions so clients can lay
     /// them out before the download; everything else is a plain file.
-    pub(crate) async fn send_file(&self, room_id: &str, path: &str, caption: Option<String>) -> Result<String> {
+    pub(crate) async fn send_file(
+        &self,
+        room_id: &str,
+        path: &str,
+        caption: Option<String>,
+    ) -> Result<String> {
         let room = self.room(room_id).await?;
         let path = Path::new(path);
-        let meta = std::fs::metadata(path).with_context(|| format!("reading {}", path.display()))?;
+        let meta =
+            std::fs::metadata(path).with_context(|| format!("reading {}", path.display()))?;
         if !meta.is_file() {
             bail!("{} is not a file", path.display());
         }
@@ -164,11 +242,16 @@ impl Core {
             bail!("file is larger than 100 MB");
         }
         let data = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
-        let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "file".to_owned());
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "file".to_owned());
         let mime = mime_guess::from_path(path).first_or_octet_stream();
 
         let info = if mime.type_() == mime::IMAGE {
-            let (w, h) = imagesize::blob_size(&data).map(|s| (s.width as u64, s.height as u64)).unwrap_or((0, 0));
+            let (w, h) = imagesize::blob_size(&data)
+                .map(|s| (s.width as u64, s.height as u64))
+                .unwrap_or((0, 0));
             AttachmentInfo::Image(BaseImageInfo {
                 width: (w > 0).then(|| UInt::new(w)).flatten(),
                 height: (h > 0).then(|| UInt::new(h)).flatten(),
@@ -177,14 +260,22 @@ impl Core {
                 is_animated: None,
             })
         } else {
-            AttachmentInfo::File(BaseFileInfo { size: UInt::new(meta.len()) })
+            AttachmentInfo::File(BaseFileInfo {
+                size: UInt::new(meta.len()),
+            })
         };
         let mut config = AttachmentConfig::new().info(info);
-        if let Some(c) = caption.map(|c| c.trim().to_owned()).filter(|c| !c.is_empty()) {
+        if let Some(c) = caption
+            .map(|c| c.trim().to_owned())
+            .filter(|c| !c.is_empty())
+        {
             config = config.caption(Some(TextMessageEventContent::plain(c)));
         }
 
-        let resp = room.send_attachment(name.clone(), &mime, data, config).await.context("uploading")?;
+        let resp = room
+            .send_attachment(name.clone(), &mime, data, config)
+            .await
+            .context("uploading")?;
         info!(room = %room.room_id(), file = %name, "attachment sent");
         Ok(resp.event_id.to_string())
     }
@@ -200,15 +291,26 @@ async fn fetch(
     let media = client.media();
     if thumbnail {
         let settings = MediaThumbnailSettings::new(UInt::from(THUMB_SIZE), UInt::from(THUMB_SIZE));
-        if let Some(bytes) = media.get_thumbnail(content, settings, true).await.context("fetching thumbnail")? {
+        if let Some(bytes) = media
+            .get_thumbnail(content, settings, true)
+            .await
+            .context("fetching thumbnail")?
+        {
             // Thumbnails are whatever the sender/server produced; sniff the type.
-            let m = infer_image_mime(&bytes).unwrap_or_else(|| mime.clone().unwrap_or_else(|| "image/jpeg".to_owned()));
+            let m = infer_image_mime(&bytes)
+                .unwrap_or_else(|| mime.clone().unwrap_or_else(|| "image/jpeg".to_owned()));
             return Ok((bytes, m, filename.to_owned()));
         }
         // No separate thumbnail (typical for encrypted images): fall through to the file.
     }
-    let bytes = media.get_file(content, true).await.context("fetching attachment")?.ok_or_else(|| anyhow!("no media source"))?;
-    let m = mime.or_else(|| infer_image_mime(&bytes)).unwrap_or_else(|| "application/octet-stream".to_owned());
+    let bytes = media
+        .get_file(content, true)
+        .await
+        .context("fetching attachment")?
+        .ok_or_else(|| anyhow!("no media source"))?;
+    let m = mime
+        .or_else(|| infer_image_mime(&bytes))
+        .unwrap_or_else(|| "application/octet-stream".to_owned());
     Ok((bytes, m, filename.to_owned()))
 }
 

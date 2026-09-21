@@ -75,11 +75,15 @@ async fn main() -> Result<()> {
     // A live daemon answers on the socket; a dead one leaves a stale file.
     if socket.exists() {
         if UnixStream::connect(&socket).await.is_ok() {
-            bail!("another omarchy-yapperd is already listening on {}", socket.display());
+            bail!(
+                "another omarchy-yapperd is already listening on {}",
+                socket.display()
+            );
         }
         std::fs::remove_file(&socket)?;
     }
-    let listener = UnixListener::bind(&socket).with_context(|| format!("binding {}", socket.display()))?;
+    let listener =
+        UnixListener::bind(&socket).with_context(|| format!("binding {}", socket.display()))?;
     std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))?;
 
     let (events, _) = broadcast::channel(256);
@@ -137,13 +141,17 @@ async fn handle_conn(stream: UnixStream, core: Arc<Core>) -> Result<()> {
         loop {
             match events.recv().await {
                 Ok(ev) => {
-                    let Ok(mut line) = serde_json::to_string(&ev) else { continue };
+                    let Ok(mut line) = serde_json::to_string(&ev) else {
+                        continue;
+                    };
                     line.push('\n');
                     if etx.send(line).await.is_err() {
                         break;
                     }
                 }
-                Err(broadcast::error::RecvError::Lagged(n)) => warn!("client lagged; dropped {n} events"),
+                Err(broadcast::error::RecvError::Lagged(n)) => {
+                    warn!("client lagged; dropped {n} events")
+                }
                 Err(broadcast::error::RecvError::Closed) => break,
             }
         }
@@ -165,7 +173,9 @@ async fn handle_conn(stream: UnixStream, core: Arc<Core>) -> Result<()> {
         let tx = tx.clone();
         tokio::spawn(async move {
             let resp = core.handle(&line).await;
-            let Ok(mut out) = serde_json::to_string(&resp) else { return };
+            let Ok(mut out) = serde_json::to_string(&resp) else {
+                return;
+            };
             out.push('\n');
             let _ = tx.send(out).await;
         });

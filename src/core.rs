@@ -33,24 +33,25 @@ use matrix_sdk::{
             filter::FilterDefinition,
             room::{Visibility, create_room},
         },
-        events::receipt::ReceiptType as StoreReceiptType,
         directory::Filter,
+        events::receipt::ReceiptType as StoreReceiptType,
         events::{
-            AnySyncMessageLikeEvent, AnySyncTimelineEvent, EmptyStateKey, InitialStateEvent, SyncMessageLikeEvent,
-            receipt::ReceiptThread,
+            AnySyncMessageLikeEvent, AnySyncTimelineEvent, EmptyStateKey, InitialStateEvent,
+            SyncMessageLikeEvent,
             reaction::{OriginalSyncReactionEvent, ReactionEventContent},
+            receipt::ReceiptThread,
             receipt::{ReceiptType as EphemeralReceiptType, SyncReceiptEvent},
             relation::{Annotation, Replacement},
-            typing::SyncTypingEvent,
             room::{
-                redaction::OriginalSyncRoomRedactionEvent,
                 encryption::RoomEncryptionEventContent,
                 member::{MembershipState, OriginalSyncRoomMemberEvent, StrippedRoomMemberEvent},
                 message::{
-                    AddMentions, MessageFormat, MessageType, OriginalSyncRoomMessageEvent, Relation,
-                    RoomMessageEventContent, RoomMessageEventContentWithoutRelation,
+                    AddMentions, MessageFormat, MessageType, OriginalSyncRoomMessageEvent,
+                    Relation, RoomMessageEventContent, RoomMessageEventContentWithoutRelation,
                 },
+                redaction::OriginalSyncRoomRedactionEvent,
             },
+            typing::SyncTypingEvent,
         },
         serde::Raw,
     },
@@ -64,9 +65,10 @@ use tracing::{info, warn};
 use url::Url;
 
 use crate::protocol::{
-    Command, DirectoryRoom, DirectoryUser, Event, InviteInfo, MemberInfo, Message, MessageEdit, Reaction,
-    ReactionEvent, ReactionSender, ReceiptInfo, Redaction, ReplyPreview, Request, Response, RoomDetails, RoomInfo,
-    SearchHit, SearchResults, SpaceInfo, Status, TimelinePage, TypingInfo, UserRef,
+    Command, DirectoryRoom, DirectoryUser, Event, InviteInfo, LinkPreview, MemberInfo, Message,
+    MessageEdit, Reaction, ReactionEvent, ReactionSender, ReceiptInfo, Redaction, ReplyPreview,
+    Request, Response, RoomDetails, RoomInfo, SearchHit, SearchResults, SpaceInfo, Status,
+    TimelinePage, TypingInfo, UserRef,
 };
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -97,8 +99,13 @@ struct PersistedSession {
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum StoredAuth {
-    Password { session: MatrixSession },
-    Oauth { client_id: ClientId, user: UserSession },
+    Password {
+        session: MatrixSession,
+    },
+    Oauth {
+        client_id: ClientId,
+        user: UserSession,
+    },
 }
 
 /// A browser sign-in that is waiting for the redirect.
@@ -131,12 +138,18 @@ pub struct Core {
     events: broadcast::Sender<Event>,
     state: tokio::sync::Mutex<State>,
     /// Verification flows we are tracking: flow id -> other user.
-    pub(crate) flows: tokio::sync::Mutex<std::collections::HashMap<String, matrix_sdk::ruma::OwnedUserId>>,
+    pub(crate) flows:
+        tokio::sync::Mutex<std::collections::HashMap<String, matrix_sdk::ruma::OwnedUserId>>,
     /// Reactions seen on a page whose target message was not on it: they
     /// come from a newer page than the message they belong to, so keep
     /// them per room until the target's page is loaded.
     /// room -> target event -> (key, sender, reaction event id)
-    pending_reactions: tokio::sync::Mutex<std::collections::HashMap<String, std::collections::HashMap<String, Vec<(String, matrix_sdk::ruma::OwnedUserId, String)>>>>,
+    pending_reactions: tokio::sync::Mutex<
+        std::collections::HashMap<
+            String,
+            std::collections::HashMap<String, Vec<(String, matrix_sdk::ruma::OwnedUserId, String)>>,
+        >,
+    >,
     /// room -> timestamp of its latest message: seeded from the server the
     /// first time a room is listed, then kept current by incoming events.
     activity: Arc<tokio::sync::Mutex<std::collections::HashMap<String, u64>>>,
@@ -155,7 +168,14 @@ impl Core {
             .mode(0o700)
             .create(&data_dir)
             .with_context(|| format!("creating {}", data_dir.display()))?;
-        Ok(Arc::new(Self { data_dir, events, state: Default::default(), flows: Default::default(), pending_reactions: Default::default(), activity: Default::default() }))
+        Ok(Arc::new(Self {
+            data_dir,
+            events,
+            state: Default::default(),
+            flows: Default::default(),
+            pending_reactions: Default::default(),
+            activity: Default::default(),
+        }))
     }
 
     pub fn events(&self) -> &broadcast::Sender<Event> {
@@ -183,7 +203,9 @@ impl Core {
         match saved.auth {
             StoredAuth::Password { session } => client.restore_session(session).await?,
             StoredAuth::Oauth { client_id, user } => {
-                client.restore_session(OAuthSession { client_id, user }).await?
+                client
+                    .restore_session(OAuthSession { client_id, user })
+                    .await?
             }
         }
         info!(user = %client.user_id().map(|u| u.to_string()).unwrap_or_default(), "session restored");
@@ -196,7 +218,14 @@ impl Core {
     pub async fn handle(self: &Arc<Self>, line: &str) -> Response {
         let req: Request = match serde_json::from_str(line) {
             Ok(r) => r,
-            Err(e) => return Response::err(Value::Null, format!("bad request: {e}")),
+            Err(e) => {
+                // Still echo the id so the client can match the error to its request.
+                let id = serde_json::from_str::<Value>(line)
+                    .ok()
+                    .and_then(|v| v.get("id").cloned())
+                    .unwrap_or(Value::Null);
+                return Response::err(id, format!("bad request: {e}"));
+            }
         };
         let id = req.id.clone();
         match self.dispatch(req.command).await {
@@ -208,7 +237,11 @@ impl Core {
     async fn dispatch(self: &Arc<Self>, cmd: Command) -> Result<Value> {
         match cmd {
             Command::Status => Ok(serde_json::to_value(self.status().await)?),
-            Command::Login { homeserver, username, password } => {
+            Command::Login {
+                homeserver,
+                username,
+                password,
+            } => {
                 self.login(homeserver, username, password).await?;
                 Ok(serde_json::to_value(self.status().await)?)
             }
@@ -225,14 +258,26 @@ impl Core {
                 Ok(serde_json::to_value(self.status().await)?)
             }
             Command::Rooms => Ok(serde_json::to_value(self.rooms().await?)?),
-            Command::Timeline { room, limit, before } => {
-                Ok(serde_json::to_value(self.timeline(&room, limit, before).await?)?)
-            }
-            Command::Send { room, body, reply_to } => {
+            Command::Timeline {
+                room,
+                limit,
+                before,
+            } => Ok(serde_json::to_value(
+                self.timeline(&room, limit, before).await?,
+            )?),
+            Command::Send {
+                room,
+                body,
+                reply_to,
+            } => {
                 let event_id = self.send(&room, body, reply_to).await?;
                 Ok(json!({ "event_id": event_id }))
             }
-            Command::Edit { room, event_id, body } => {
+            Command::Edit {
+                room,
+                event_id,
+                body,
+            } => {
                 let id = self.edit(&room, &event_id, body).await?;
                 Ok(json!({ "event_id": id }))
             }
@@ -242,16 +287,26 @@ impl Core {
                 r.redact(&id, None, None).await.context("deleting")?;
                 Ok(json!({}))
             }
-            Command::React { room, event_id, key } => {
+            Command::React {
+                room,
+                event_id,
+                key,
+            } => {
                 let r = self.room(&room).await?;
                 let id = matrix_sdk::ruma::EventId::parse(&event_id).context("invalid event id")?;
-                let resp = r.send(ReactionEventContent::new(Annotation::new(id, key))).await.context("reacting")?;
+                let resp = r
+                    .send(ReactionEventContent::new(Annotation::new(id, key)))
+                    .await
+                    .context("reacting")?;
                 Ok(json!({ "reaction_id": resp.response.event_id.to_string() }))
             }
             Command::Unreact { room, reaction_id } => {
                 let r = self.room(&room).await?;
-                let id = matrix_sdk::ruma::EventId::parse(&reaction_id).context("invalid event id")?;
-                r.redact(&id, None, None).await.context("removing reaction")?;
+                let id =
+                    matrix_sdk::ruma::EventId::parse(&reaction_id).context("invalid event id")?;
+                r.redact(&id, None, None)
+                    .await
+                    .context("removing reaction")?;
                 Ok(json!({}))
             }
             Command::Typing { room, typing } => {
@@ -259,10 +314,14 @@ impl Core {
                 r.typing_notice(typing).await.context("typing notice")?;
                 Ok(json!({}))
             }
-            Command::RoomDetails { room } => Ok(serde_json::to_value(self.room_details(&room).await?)?),
-            Command::Members { room, query, limit } => Ok(serde_json::to_value(self.members(&room, &query, limit).await?)?),
-            Command::Avatar { url } => {
-                let path = self.avatar(&url).await?;
+            Command::RoomDetails { room } => {
+                Ok(serde_json::to_value(self.room_details(&room).await?)?)
+            }
+            Command::Members { room, query, limit } => Ok(serde_json::to_value(
+                self.members(&room, &query, limit).await?,
+            )?),
+            Command::Avatar { url, size } => {
+                let path = self.avatar(&url, size.unwrap_or(96)).await?;
                 Ok(json!({ "path": path }))
             }
             Command::Invite { room, user } => {
@@ -274,13 +333,17 @@ impl Core {
             Command::Kick { room, user, reason } => {
                 let r = self.room(&room).await?;
                 let u = UserId::parse(user.trim()).context("expected @user:server")?;
-                r.kick_user(&u, reason.as_deref().filter(|s| !s.trim().is_empty())).await.context("removing")?;
+                r.kick_user(&u, reason.as_deref().filter(|s| !s.trim().is_empty()))
+                    .await
+                    .context("removing")?;
                 Ok(json!({}))
             }
             Command::Ban { room, user, reason } => {
                 let r = self.room(&room).await?;
                 let u = UserId::parse(user.trim()).context("expected @user:server")?;
-                r.ban_user(&u, reason.as_deref().filter(|s| !s.trim().is_empty())).await.context("banning")?;
+                r.ban_user(&u, reason.as_deref().filter(|s| !s.trim().is_empty()))
+                    .await
+                    .context("banning")?;
                 Ok(json!({}))
             }
             Command::SetName { room, name } => {
@@ -294,7 +357,9 @@ impl Core {
             }
             Command::SetTopic { room, topic } => {
                 let r = self.room(&room).await?;
-                r.set_room_topic(topic.trim()).await.context("setting topic")?;
+                r.set_room_topic(topic.trim())
+                    .await
+                    .context("setting topic")?;
                 Ok(json!({}))
             }
             Command::SetNotificationMode { room, mode } => {
@@ -303,43 +368,68 @@ impl Core {
             }
             Command::SetFavourite { room, favourite } => {
                 let r = self.room(&room).await?;
-                r.set_is_favourite(favourite, None).await.context("updating favourite")?;
+                r.set_is_favourite(favourite, None)
+                    .await
+                    .context("updating favourite")?;
                 let _ = self.events().send(Event::RoomsChanged);
                 Ok(json!({}))
             }
             Command::Spaces => Ok(serde_json::to_value(self.spaces().await?)?),
-            Command::Search { query, room, limit } => Ok(serde_json::to_value(self.search(&query, room.as_deref(), limit).await?)?),
+            Command::Search { query, room, limit } => Ok(serde_json::to_value(
+                self.search(&query, room.as_deref(), limit).await?,
+            )?),
+            Command::Preview { url } => Ok(serde_json::to_value(self.preview(&url).await?)?),
             Command::MarkRead { room, event_id } => {
                 self.mark_read(&room, &event_id).await?;
                 Ok(json!({}))
             }
-            Command::SearchRooms { query, server, limit } => {
-                Ok(serde_json::to_value(self.search_rooms(&query, server.as_deref(), limit).await?)?)
-            }
+            Command::SearchRooms {
+                query,
+                server,
+                limit,
+            } => Ok(serde_json::to_value(
+                self.search_rooms(&query, server.as_deref(), limit).await?,
+            )?),
             Command::Join { room } => {
                 let room = self.join(&room).await?;
                 Ok(serde_json::to_value(self.room_info(&room).await)?)
             }
-            Command::SearchUsers { query, limit } => {
-                Ok(serde_json::to_value(self.search_users(&query, limit).await?)?)
-            }
+            Command::SearchUsers { query, limit } => Ok(serde_json::to_value(
+                self.search_users(&query, limit).await?,
+            )?),
             Command::Dm { user } => {
                 let room = self.dm(&user).await?;
                 Ok(serde_json::to_value(self.room_info(&room).await)?)
             }
-            Command::CreateRoom { name, topic, encrypted, private } => {
+            Command::CreateRoom {
+                name,
+                topic,
+                encrypted,
+                private,
+            } => {
                 let room = self.create_room(name, topic, encrypted, private).await?;
                 Ok(serde_json::to_value(self.room_info(&room).await)?)
             }
             Command::Invites => Ok(serde_json::to_value(self.invites().await?)?),
-            Command::VerificationStatus => Ok(serde_json::to_value(self.verification_status().await?)?),
+            Command::VerificationStatus => {
+                Ok(serde_json::to_value(self.verification_status().await?)?)
+            }
             Command::VerifyRequest => {
                 let flow_id = self.verify_request().await?;
                 Ok(json!({ "flow_id": flow_id }))
             }
-            Command::VerifyAccept { flow_id } => { self.verify_accept(&flow_id).await?; Ok(json!({})) }
-            Command::VerifyConfirm { flow_id } => { self.verify_confirm(&flow_id).await?; Ok(json!({})) }
-            Command::VerifyCancel { flow_id } => { self.verify_cancel(&flow_id).await?; Ok(json!({})) }
+            Command::VerifyAccept { flow_id } => {
+                self.verify_accept(&flow_id).await?;
+                Ok(json!({}))
+            }
+            Command::VerifyConfirm { flow_id } => {
+                self.verify_confirm(&flow_id).await?;
+                Ok(json!({}))
+            }
+            Command::VerifyCancel { flow_id } => {
+                self.verify_cancel(&flow_id).await?;
+                Ok(json!({}))
+            }
             Command::Recover { key } => {
                 self.recover(&key).await?;
                 Ok(serde_json::to_value(self.verification_status().await?)?)
@@ -352,11 +442,19 @@ impl Core {
                 let key = self.reset_recovery_key().await?;
                 Ok(json!({ "recovery_key": key }))
             }
-            Command::Download { room, event_id, thumbnail } => {
+            Command::Download {
+                room,
+                event_id,
+                thumbnail,
+            } => {
                 let (path, mime) = self.download(&room, &event_id, thumbnail).await?;
                 Ok(json!({ "path": path, "mime": mime }))
             }
-            Command::SendFile { room, path, caption } => {
+            Command::SendFile {
+                room,
+                path,
+                caption,
+            } => {
                 let event_id = self.send_file(&room, &path, caption).await?;
                 Ok(json!({ "event_id": event_id }))
             }
@@ -382,7 +480,10 @@ impl Core {
             logged_in: st.client.is_some(),
             syncing: st.syncing,
             pending_login: st.login_pending(),
-            user_id: st.client.as_ref().and_then(|c| c.user_id().map(|u| u.to_string())),
+            user_id: st
+                .client
+                .as_ref()
+                .and_then(|c| c.user_id().map(|u| u.to_string())),
             homeserver: st.client.as_ref().map(|c| c.homeserver().to_string()),
             error: st.error.clone(),
         }
@@ -393,12 +494,20 @@ impl Core {
     }
 
     pub(crate) async fn client(&self) -> Result<Client> {
-        self.state.lock().await.client.clone().ok_or_else(|| anyhow!("not logged in"))
+        self.state
+            .lock()
+            .await
+            .client
+            .clone()
+            .ok_or_else(|| anyhow!("not logged in"))
     }
 
     pub(crate) async fn room(&self, id: &str) -> Result<Room> {
         let id: OwnedRoomId = RoomId::parse(id).context("invalid room id")?;
-        self.client().await?.get_room(&id).ok_or_else(|| anyhow!("unknown room {id}"))
+        self.client()
+            .await?
+            .get_room(&id)
+            .ok_or_else(|| anyhow!("unknown room {id}"))
     }
 
     // ---------- login / logout ----------
@@ -409,8 +518,16 @@ impl Core {
         // ThreadRng is !Send, so it must not live across an await.
         let (store_name, store_passphrase) = {
             let mut r = rng();
-            let name: String = (&mut r).sample_iter(Alphanumeric).take(8).map(char::from).collect();
-            let pass: String = (&mut r).sample_iter(Alphanumeric).take(32).map(char::from).collect();
+            let name: String = (&mut r)
+                .sample_iter(Alphanumeric)
+                .take(8)
+                .map(char::from)
+                .collect();
+            let pass: String = (&mut r)
+                .sample_iter(Alphanumeric)
+                .take(32)
+                .map(char::from)
+                .collect();
             (name, pass)
         };
         let store_path = self.data_dir.join(format!("store-{store_name}"));
@@ -440,7 +557,12 @@ impl Core {
         Ok(())
     }
 
-    async fn login(self: &Arc<Self>, homeserver: String, username: String, password: String) -> Result<()> {
+    async fn login(
+        self: &Arc<Self>,
+        homeserver: String,
+        username: String,
+        password: String,
+    ) -> Result<()> {
         self.ensure_signed_out().await?;
         let (client, store_path, store_passphrase) = self.build_client(&homeserver).await?;
 
@@ -515,7 +637,11 @@ impl Core {
                     Ok(None) => bail!("the browser returned without sign-in data"),
                     Ok(Some(q)) => q,
                 };
-                client.oauth().finish_login(query.into()).await.context("finishing browser sign-in")?;
+                client
+                    .oauth()
+                    .finish_login(query.into())
+                    .await
+                    .context("finishing browser sign-in")?;
                 let full = client
                     .oauth()
                     .full_session()
@@ -524,7 +650,10 @@ impl Core {
                     homeserver: client.homeserver().to_string(),
                     store_path: task_store.clone(),
                     store_passphrase: store_passphrase.clone(),
-                    auth: StoredAuth::Oauth { client_id: full.client_id, user: full.user },
+                    auth: StoredAuth::Oauth {
+                        client_id: full.client_id,
+                        user: full.user,
+                    },
                     sync_token: None,
                 };
                 write_private(&core.session_file(), &serde_json::to_vec(&saved)?)?;
@@ -551,7 +680,9 @@ impl Core {
 
     async fn login_cancel(&self) -> Result<()> {
         let pending = self.state.lock().await.pending.take();
-        let Some(p) = pending else { bail!("no browser sign-in in progress") };
+        let Some(p) = pending else {
+            bail!("no browser sign-in in progress")
+        };
         if p.task.is_finished() {
             return Ok(());
         }
@@ -575,7 +706,9 @@ impl Core {
             p.task.abort();
             let _ = std::fs::remove_dir_all(&p.store_path);
         }
-        let Some(client) = client else { bail!("not logged in") };
+        let Some(client) = client else {
+            bail!("not logged in")
+        };
         if let Err(e) = client.logout().await {
             // The token may already be dead; local state is wiped regardless.
             warn!("server logout failed: {e:#}");
@@ -604,7 +737,10 @@ impl Core {
         if let Err(e) = client.event_cache().subscribe() {
             warn!("event cache: {e:#}");
         }
-        client.add_event_handler_context(HandlerCtx { events: self.events.clone(), activity: self.activity.clone() });
+        client.add_event_handler_context(HandlerCtx {
+            events: self.events.clone(),
+            activity: self.activity.clone(),
+        });
         client.add_event_handler(on_room_message);
         client.add_event_handler(on_stripped_member);
         client.add_event_handler(on_member);
@@ -632,8 +768,12 @@ impl Core {
                         }
                     }
                     SessionChange::UnknownToken(info) => {
-                        warn!(soft_logout = info.soft_logout, "homeserver rejected our token");
-                        core.set_error(Some("session expired; sign out and sign in again".into())).await;
+                        warn!(
+                            soft_logout = info.soft_logout,
+                            "homeserver rejected our token"
+                        );
+                        core.set_error(Some("session expired; sign out and sign in again".into()))
+                            .await;
                     }
                 }
             }
@@ -647,10 +787,16 @@ impl Core {
             use matrix_sdk_base::RoomInfoNotableUpdateReasons as R;
             let mut pending = false;
             loop {
-                let wait = if pending { Duration::from_millis(300) } else { Duration::from_secs(3600) };
+                let wait = if pending {
+                    Duration::from_millis(300)
+                } else {
+                    Duration::from_secs(3600)
+                };
                 match tokio::time::timeout(wait, updates.recv()).await {
                     Ok(Ok(u)) => {
-                        if u.reasons.intersects(R::READ_RECEIPT | R::UNREAD_MARKER | R::LATEST_EVENT) {
+                        if u.reasons
+                            .intersects(R::READ_RECEIPT | R::UNREAD_MARKER | R::LATEST_EVENT)
+                        {
                             pending = true;
                         }
                     }
@@ -683,11 +829,17 @@ impl Core {
         let mut saved: PersistedSession = serde_json::from_str(&text)?;
         saved.auth = match saved.auth {
             StoredAuth::Password { .. } => StoredAuth::Password {
-                session: client.matrix_auth().session().ok_or_else(|| anyhow!("no session"))?,
+                session: client
+                    .matrix_auth()
+                    .session()
+                    .ok_or_else(|| anyhow!("no session"))?,
             },
             StoredAuth::Oauth { client_id, .. } => StoredAuth::Oauth {
                 client_id,
-                user: client.oauth().user_session().ok_or_else(|| anyhow!("no session"))?,
+                user: client
+                    .oauth()
+                    .user_session()
+                    .ok_or_else(|| anyhow!("no session"))?,
             },
         };
         write_private(&file, &serde_json::to_vec(&saved)?)
@@ -794,7 +946,10 @@ impl Core {
         let mut read_at: Option<u64> = None;
         if let Some(me) = me.as_deref() {
             for thread in [ReceiptThread::Unthreaded, ReceiptThread::Main] {
-                if let Ok(Some((eid, receipt))) = room.load_user_receipt(StoreReceiptType::Read, &thread, me).await {
+                if let Ok(Some((eid, receipt))) = room
+                    .load_user_receipt(StoreReceiptType::Read, &thread, me)
+                    .await
+                {
                     read_marker = Some(eid.to_string());
                     read_at = receipt.ts.map(|t| t.0.into());
                     break;
@@ -812,7 +967,11 @@ impl Core {
                 for ev in events {
                     if let Ok(AnySyncTimelineEvent::MessageLike(m)) = ev.raw().deserialize() {
                         let ts = u64::from(m.origin_server_ts().0);
-                        let is_msg = matches!(m, AnySyncMessageLikeEvent::RoomMessage(_) | AnySyncMessageLikeEvent::RoomEncrypted(_));
+                        let is_msg = matches!(
+                            m,
+                            AnySyncMessageLikeEvent::RoomMessage(_)
+                                | AnySyncMessageLikeEvent::RoomEncrypted(_)
+                        );
                         if is_msg {
                             last_activity = Some(last_activity.map_or(ts, |t| t.max(ts)));
                             if let (Some(me), Some(at)) = (me.as_deref(), read_at) {
@@ -838,7 +997,10 @@ impl Core {
             notification_mode,
             favourite: room.is_favourite(),
             low_priority: room.is_low_priority(),
-            last_activity: room.recency_stamp().map(u64::from).or(self.activity_of(&room, last_activity).await),
+            last_activity: room
+                .recency_stamp()
+                .map(u64::from)
+                .or(self.activity_of(&room, last_activity).await),
             unread,
             highlights: room.num_unread_mentions().max(counts.highlight_count),
             notifications: counts.notification_count,
@@ -848,7 +1010,12 @@ impl Core {
 
     // ---------- discovery ----------
 
-    async fn search_rooms(&self, query: &str, server: Option<&str>, limit: u32) -> Result<Vec<DirectoryRoom>> {
+    async fn search_rooms(
+        &self,
+        query: &str,
+        server: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<DirectoryRoom>> {
         let client = self.client().await?;
         let mut req = get_public_rooms_filtered::v3::Request::new();
         req.limit = Some(UInt::from(limit.clamp(1, 100)));
@@ -866,7 +1033,9 @@ impl Core {
             .chunk
             .into_iter()
             .map(|r| DirectoryRoom {
-                joined: client.get_room(&r.room_id).is_some_and(|room| room.state() == RoomState::Joined),
+                joined: client
+                    .get_room(&r.room_id)
+                    .is_some_and(|room| room.state() == RoomState::Joined),
                 id: r.room_id.to_string(),
                 name: r
                     .name
@@ -882,21 +1051,34 @@ impl Core {
 
     async fn join(&self, id_or_alias: &str) -> Result<Room> {
         let client = self.client().await?;
-        let target = RoomOrAliasId::parse(id_or_alias.trim()).context("expected #alias:server or !id:server")?;
-        let via: Vec<OwnedServerName> = target.server_name().map(|s| vec![s.to_owned()]).unwrap_or_default();
-        client.join_room_by_id_or_alias(&target, &via).await.context("joining room")
+        let target = RoomOrAliasId::parse(id_or_alias.trim())
+            .context("expected #alias:server or !id:server")?;
+        let via: Vec<OwnedServerName> = target
+            .server_name()
+            .map(|s| vec![s.to_owned()])
+            .unwrap_or_default();
+        client
+            .join_room_by_id_or_alias(&target, &via)
+            .await
+            .context("joining room")
     }
 
     async fn search_users(&self, query: &str, limit: u32) -> Result<Vec<DirectoryUser>> {
         let client = self.client().await?;
-        let resp = tokio::time::timeout(SEARCH_TIMEOUT, client.search_users(query.trim(), u64::from(limit.clamp(1, 50))))
-            .await
-            .map_err(|_| anyhow!("the user directory did not answer in time"))?
-            .context("searching users")?;
+        let resp = tokio::time::timeout(
+            SEARCH_TIMEOUT,
+            client.search_users(query.trim(), u64::from(limit.clamp(1, 50))),
+        )
+        .await
+        .map_err(|_| anyhow!("the user directory did not answer in time"))?
+        .context("searching users")?;
         Ok(resp
             .results
             .into_iter()
-            .map(|u| DirectoryUser { id: u.user_id.to_string(), name: u.display_name })
+            .map(|u| DirectoryUser {
+                id: u.user_id.to_string(),
+                name: u.display_name,
+            })
             .collect())
     }
 
@@ -908,10 +1090,19 @@ impl Core {
                 return Ok(room);
             }
         }
-        client.create_dm(&user_id).await.context("creating direct chat")
+        client
+            .create_dm(&user_id)
+            .await
+            .context("creating direct chat")
     }
 
-    async fn create_room(&self, name: String, topic: Option<String>, encrypted: bool, private: bool) -> Result<Room> {
+    async fn create_room(
+        &self,
+        name: String,
+        topic: Option<String>,
+        encrypted: bool,
+        private: bool,
+    ) -> Result<Room> {
         let client = self.client().await?;
         let name = name.trim().to_owned();
         if name.is_empty() {
@@ -920,8 +1111,16 @@ impl Core {
         let mut req = create_room::v3::Request::new();
         req.name = Some(name);
         req.topic = topic.map(|t| t.trim().to_owned()).filter(|t| !t.is_empty());
-        req.preset = Some(if private { create_room::v3::RoomPreset::PrivateChat } else { create_room::v3::RoomPreset::PublicChat });
-        req.visibility = if private { Visibility::Private } else { Visibility::Public };
+        req.preset = Some(if private {
+            create_room::v3::RoomPreset::PrivateChat
+        } else {
+            create_room::v3::RoomPreset::PublicChat
+        });
+        req.visibility = if private {
+            Visibility::Private
+        } else {
+            Visibility::Public
+        };
         if encrypted {
             let content = RoomEncryptionEventContent::with_recommended_defaults();
             req.initial_state = vec![InitialStateEvent::new(EmptyStateKey, content).to_raw_any()];
@@ -938,7 +1137,12 @@ impl Core {
         Ok(out)
     }
 
-    async fn timeline(&self, room_id: &str, limit: u32, before: Option<String>) -> Result<TimelinePage> {
+    async fn timeline(
+        &self,
+        room_id: &str,
+        limit: u32,
+        before: Option<String>,
+    ) -> Result<TimelinePage> {
         let room = self.room(room_id).await?;
         let mut from = before.filter(|t| !t.is_empty());
         let mut out = Vec::new();
@@ -947,7 +1151,10 @@ impl Core {
         // keep going so a page always carries messages or the real end.
         // Reactions on this page keyed by their target; plus any carried
         // over from newer pages whose targets we are about to see.
-        let mut reactions: std::collections::HashMap<String, Vec<(String, matrix_sdk::ruma::OwnedUserId, String)>> = {
+        let mut reactions: std::collections::HashMap<
+            String,
+            Vec<(String, matrix_sdk::ruma::OwnedUserId, String)>,
+        > = {
             let mut p = self.pending_reactions.lock().await;
             p.remove(room_id).unwrap_or_default()
         };
@@ -964,14 +1171,25 @@ impl Core {
                 ))) = ev.raw().deserialize()
                 {
                     let a = &r.content.relates_to;
-                    reactions.entry(a.event_id.to_string()).or_default().push((a.key.clone(), r.sender.clone(), r.event_id.to_string()));
+                    reactions.entry(a.event_id.to_string()).or_default().push((
+                        a.key.clone(),
+                        r.sender.clone(),
+                        r.event_id.to_string(),
+                    ));
                     continue;
                 }
-                if let Ok(AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::RoomRedaction(
-                    matrix_sdk::ruma::events::room::redaction::SyncRoomRedactionEvent::Original(rd),
-                ))) = ev.raw().deserialize()
+                if let Ok(AnySyncTimelineEvent::MessageLike(
+                    AnySyncMessageLikeEvent::RoomRedaction(
+                        matrix_sdk::ruma::events::room::redaction::SyncRoomRedactionEvent::Original(
+                            rd,
+                        ),
+                    ),
+                )) = ev.raw().deserialize()
                 {
-                    redacted.insert(rd.redacts(&room.clone_info().room_version_rules_or_default().redaction).to_string());
+                    redacted.insert(
+                        rd.redacts(&room.clone_info().room_version_rules_or_default().redaction)
+                            .to_string(),
+                    );
                     continue;
                 }
                 if let Some(m) = self.message_from_event(&room, ev).await {
@@ -981,7 +1199,11 @@ impl Core {
             // The server omits `end` when there is nothing further back, and
             // under-fills a chunk only at the start of history — matrix.org
             // sends a cursor either way, so use the fill as the signal.
-            next = if raw_count < limit.clamp(1, 200) as usize { None } else { page.end.clone() };
+            next = if raw_count < limit.clamp(1, 200) as usize {
+                None
+            } else {
+                page.end.clone()
+            };
             if !out.is_empty() || next.is_none() {
                 break;
             }
@@ -997,14 +1219,24 @@ impl Core {
         }
         // Whatever is left targets messages on an older page.
         if !reactions.is_empty() {
-            self.pending_reactions.lock().await.insert(room_id.to_owned(), reactions);
+            self.pending_reactions
+                .lock()
+                .await
+                .insert(room_id.to_owned(), reactions);
         }
         out.reverse(); // backward pagination yields newest first
-        Ok(TimelinePage { messages: out, next })
+        Ok(TimelinePage {
+            messages: out,
+            next,
+        })
     }
 
     /// A timeline event as a message, or None for anything that is not one.
-    async fn message_from_event(&self, room: &Room, ev: matrix_sdk::deserialized_responses::TimelineEvent) -> Option<Message> {
+    async fn message_from_event(
+        &self,
+        room: &Room,
+        ev: matrix_sdk::deserialized_responses::TimelineEvent,
+    ) -> Option<Message> {
         let encrypted = ev.encryption_info().is_some();
         let parsed = ev.raw().deserialize().ok()?;
         match parsed {
@@ -1025,9 +1257,11 @@ impl Core {
                 Some(m)
             }
             // Joins, leaves, invites, kicks, name changes: small system lines.
-            AnySyncTimelineEvent::State(matrix_sdk::ruma::events::AnySyncStateEvent::RoomMember(
-                matrix_sdk::ruma::events::SyncStateEvent::Original(m),
-            )) => {
+            AnySyncTimelineEvent::State(
+                matrix_sdk::ruma::events::AnySyncStateEvent::RoomMember(
+                    matrix_sdk::ruma::events::SyncStateEvent::Original(m),
+                ),
+            ) => {
                 let text = membership_line(room, &m).await?;
                 Some(Message {
                     room: room.room_id().to_string(),
@@ -1054,10 +1288,15 @@ impl Core {
             // encrypted room the shell that remains is an m.room.encrypted.
             AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::RoomMessage(
                 SyncMessageLikeEvent::Redacted(r),
-            )) => Some(deleted_placeholder(room, &r.sender, &r.event_id, r.origin_server_ts, encrypted).await),
+            )) => Some(
+                deleted_placeholder(room, &r.sender, &r.event_id, r.origin_server_ts, encrypted)
+                    .await,
+            ),
             AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::RoomEncrypted(
                 SyncMessageLikeEvent::Redacted(r),
-            )) => Some(deleted_placeholder(room, &r.sender, &r.event_id, r.origin_server_ts, true).await),
+            )) => Some(
+                deleted_placeholder(room, &r.sender, &r.event_id, r.origin_server_ts, true).await,
+            ),
             // Still encrypted: we have no key (yet). Show a placeholder so
             // the gap is visible; backup or key sharing may fill it later.
             AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::RoomEncrypted(
@@ -1096,17 +1335,21 @@ impl Core {
         let room = self.room(room_id).await?;
         let content = match reply_to.filter(|r| !r.is_empty()) {
             Some(target) => {
-                let target = matrix_sdk::ruma::EventId::parse(&target).context("invalid reply target")?;
+                let target =
+                    matrix_sdk::ruma::EventId::parse(&target).context("invalid reply target")?;
                 let reply = matrix_sdk::room::reply::Reply {
                     event_id: target,
                     enforce_thread: matrix_sdk::room::reply::EnforceThread::MaybeThreaded,
                     add_mentions: AddMentions::Yes,
                 };
-                room.make_reply_event(RoomMessageEventContentWithoutRelation::text_plain(body), reply)
-                    .await
-                    .context("building the reply")?
+                room.make_reply_event(
+                    RoomMessageEventContentWithoutRelation::text_markdown(body),
+                    reply,
+                )
+                .await
+                .context("building the reply")?
             }
-            None => RoomMessageEventContent::text_plain(body),
+            None => RoomMessageEventContent::text_markdown(body),
         };
         let resp = room.send(content).await.context("sending")?;
         Ok(resp.response.event_id.to_string())
@@ -1118,7 +1361,9 @@ impl Core {
         let content = room
             .make_edit_event(
                 &target,
-                matrix_sdk::room::edit::EditedContent::RoomMessage(RoomMessageEventContentWithoutRelation::text_plain(body)),
+                matrix_sdk::room::edit::EditedContent::RoomMessage(
+                    RoomMessageEventContentWithoutRelation::text_markdown(body),
+                ),
             )
             .await
             .context("building the edit")?;
@@ -1132,7 +1377,9 @@ impl Core {
         let receipts = matrix_sdk::room::Receipts::new()
             .fully_read_marker(event_id.clone())
             .public_read_receipt(event_id);
-        room.send_multiple_receipts(receipts).await.context("sending read receipt")?;
+        room.send_multiple_receipts(receipts)
+            .await
+            .context("sending read receipt")?;
         Ok(())
     }
 }
@@ -1149,7 +1396,9 @@ fn client_metadata() -> Raw<ClientMetadata> {
         tos_uri: Some(client_uri.clone()),
         ..ClientMetadata::new(
             ApplicationType::Native,
-            vec![OAuthGrantType::AuthorizationCode { redirect_uris: vec![v4, v6] }],
+            vec![OAuthGrantType::AuthorizationCode {
+                redirect_uris: vec![v4, v6],
+            }],
             client_uri,
         )
     };
@@ -1173,7 +1422,12 @@ async fn on_room_message(
     // rooms, mentions and keyword rules all land here.
     let notify = Some(actions.iter().any(|a| a.should_notify()));
     let highlight = Some(actions.iter().any(|a| a.is_highlight()));
-    if let Some(Relation::Replacement(Replacement { event_id, new_content, .. })) = &event.content.relates_to {
+    if let Some(Relation::Replacement(Replacement {
+        event_id,
+        new_content,
+        ..
+    })) = &event.content.relates_to
+    {
         let html = formatted_html(&new_content.msgtype);
         let _ = ctx.events.send(Event::MessageEdited(MessageEdit {
             room: room.room_id().to_string(),
@@ -1206,12 +1460,17 @@ fn formatted_html(msgtype: &MessageType) -> Option<String> {
 }
 
 /// The newest edit the server attached to an event, if any.
-fn bundled_edit(raw: &matrix_sdk::ruma::serde::Raw<AnySyncTimelineEvent>) -> Option<(String, Option<String>)> {
+fn bundled_edit(
+    raw: &matrix_sdk::ruma::serde::Raw<AnySyncTimelineEvent>,
+) -> Option<(String, Option<String>)> {
     let unsigned: serde_json::Value = raw.get_field("unsigned").ok().flatten()?;
     let replace = unsigned.get("m.relations")?.get("m.replace")?;
     let new_content = replace.get("content")?.get("m.new_content")?;
     let body = new_content.get("body")?.as_str()?.to_owned();
-    let html = match (new_content.get("format").and_then(|f| f.as_str()), new_content.get("formatted_body").and_then(|b| b.as_str())) {
+    let html = match (
+        new_content.get("format").and_then(|f| f.as_str()),
+        new_content.get("formatted_body").and_then(|b| b.as_str()),
+    ) {
         (Some("org.matrix.custom.html"), Some(h)) => Some(h.to_owned()),
         _ => None,
     };
@@ -1231,11 +1490,20 @@ fn strip_reply_fallback(body: &str) -> String {
         }
     }
     let rest: Vec<&str> = lines.collect();
-    if rest.is_empty() { body.to_owned() } else { rest.join("\n") }
+    if rest.is_empty() {
+        body.to_owned()
+    } else {
+        rest.join("\n")
+    }
 }
 
 /// Invites arrive as stripped state; announce the ones addressed to us.
-async fn on_stripped_member(event: StrippedRoomMemberEvent, room: Room, client: Client, ctx: Ctx<HandlerCtx>) {
+async fn on_stripped_member(
+    event: StrippedRoomMemberEvent,
+    room: Room,
+    client: Client,
+    ctx: Ctx<HandlerCtx>,
+) {
     if event.content.membership != MembershipState::Invite {
         return;
     }
@@ -1281,10 +1549,16 @@ async fn to_message(room: &Room, ev: OriginalSyncRoomMessageEvent, encrypted: bo
     };
     let html = formatted_html(&ev.content.msgtype);
     let reply_to = match &ev.content.relates_to {
-        Some(Relation::Reply(in_reply_to)) => reply_preview(room, &in_reply_to.in_reply_to.event_id).await,
+        Some(Relation::Reply(in_reply_to)) => {
+            reply_preview(room, &in_reply_to.in_reply_to.event_id).await
+        }
         _ => None,
     };
-    let body = if reply_to.is_some() { strip_reply_fallback(ev.content.body()) } else { ev.content.body().to_owned() };
+    let body = if reply_to.is_some() {
+        strip_reply_fallback(ev.content.body())
+    } else {
+        ev.content.body().to_owned()
+    };
     // The HTML fallback carries the quote in <mx-reply>, which the client strips.
     Message {
         room: room.room_id().to_string(),
@@ -1346,7 +1620,10 @@ async fn user_ref(room: &Room, user: &matrix_sdk::ruma::UserId) -> UserRef {
         Ok(Some(m)) => m.name().to_owned(),
         _ => user.localpart().to_owned(),
     };
-    UserRef { id: user.to_string(), name }
+    UserRef {
+        id: user.to_string(),
+        name,
+    }
 }
 
 /// Group raw reactions by key, count them, and remember our own event id.
@@ -1364,7 +1641,12 @@ async fn aggregate_reactions(
         }
         let entry = by_key.entry(key.clone()).or_insert_with(|| {
             order.push(key.clone());
-            Reaction { key: key.clone(), count: 0, senders: Vec::new(), mine: None }
+            Reaction {
+                key: key.clone(),
+                count: 0,
+                senders: Vec::new(),
+                mine: None,
+            }
         });
         // One reaction per user per key.
         if entry.senders.iter().any(|u| u.id == sender.as_str()) {
@@ -1375,18 +1657,36 @@ async fn aggregate_reactions(
             entry.mine = Some(id.clone());
         }
         let u = user_ref(room, &sender).await;
-        entry.senders.push(ReactionSender { id: u.id, name: u.name, reaction_id: id });
+        entry.senders.push(ReactionSender {
+            id: u.id,
+            name: u.name,
+            reaction_id: id,
+        });
     }
-    order.into_iter().filter_map(|k| by_key.remove(&k)).collect()
+    order
+        .into_iter()
+        .filter_map(|k| by_key.remove(&k))
+        .collect()
 }
 
 /// Others whose read receipt sits on this event. Clients send receipts
 /// either unthreaded or on the main thread; both mean "read up to here".
-async fn read_by(room: &Room, event_id: &str, me: Option<&matrix_sdk::ruma::UserId>) -> Vec<UserRef> {
-    let Ok(id) = matrix_sdk::ruma::EventId::parse(event_id) else { return Vec::new() };
+async fn read_by(
+    room: &Room,
+    event_id: &str,
+    me: Option<&matrix_sdk::ruma::UserId>,
+) -> Vec<UserRef> {
+    let Ok(id) = matrix_sdk::ruma::EventId::parse(event_id) else {
+        return Vec::new();
+    };
     let mut out: Vec<UserRef> = Vec::new();
     for thread in [ReceiptThread::Unthreaded, ReceiptThread::Main] {
-        let Ok(list) = room.load_event_receipts(StoreReceiptType::Read, &thread, &id).await else { continue };
+        let Ok(list) = room
+            .load_event_receipts(StoreReceiptType::Read, &thread, &id)
+            .await
+        else {
+            continue;
+        };
         for (user, _) in list {
             if me == Some(user.as_ref()) || out.iter().any(|u| u.id == user.as_str()) {
                 continue;
@@ -1417,7 +1717,10 @@ async fn on_redaction(event: OriginalSyncRoomRedactionEvent, room: Room, ctx: Ct
     }
     let rules = room.clone_info().room_version_rules_or_default();
     let target = event.redacts(&rules.redaction);
-    let _ = ctx.events.send(Event::Redacted(Redaction { room: room.room_id().to_string(), event_id: target.to_string() }));
+    let _ = ctx.events.send(Event::Redacted(Redaction {
+        room: room.room_id().to_string(),
+        event_id: target.to_string(),
+    }));
 }
 
 async fn on_typing(event: SyncTypingEvent, room: Room, client: Client, ctx: Ctx<HandlerCtx>) {
@@ -1428,7 +1731,10 @@ async fn on_typing(event: SyncTypingEvent, room: Room, client: Client, ctx: Ctx<
         }
         users.push(user_ref(&room, u).await);
     }
-    let _ = ctx.events.send(Event::Typing(TypingInfo { room: room.room_id().to_string(), users }));
+    let _ = ctx.events.send(Event::Typing(TypingInfo {
+        room: room.room_id().to_string(),
+        users,
+    }));
 }
 
 async fn on_receipt(event: SyncReceiptEvent, room: Room, client: Client, ctx: Ctx<HandlerCtx>) {
@@ -1440,19 +1746,31 @@ async fn on_receipt(event: SyncReceiptEvent, room: Room, client: Client, ctx: Ct
                 if client.user_id().is_some_and(|me| me == user) {
                     continue;
                 }
-                by_event.entry(event_id.to_string()).or_default().push(user_ref(&room, user).await);
+                by_event
+                    .entry(event_id.to_string())
+                    .or_default()
+                    .push(user_ref(&room, user).await);
             }
         }
     }
     for (event_id, users) in by_event {
-        let _ = ctx.events.send(Event::Receipt(ReceiptInfo { room: room.room_id().to_string(), event_id, users }));
+        let _ = ctx.events.send(Event::Receipt(ReceiptInfo {
+            room: room.room_id().to_string(),
+            event_id,
+            users,
+        }));
     }
 }
 
 /// "X joined", "X left", … for a member event, or None for changes not worth a line.
-async fn membership_line(room: &Room, ev: &matrix_sdk::ruma::events::room::member::OriginalSyncRoomMemberEvent) -> Option<String> {
+async fn membership_line(
+    room: &Room,
+    ev: &matrix_sdk::ruma::events::room::member::OriginalSyncRoomMemberEvent,
+) -> Option<String> {
     use matrix_sdk::ruma::events::room::member::MembershipChange as C;
-    let who = |name: &Option<String>, id: &matrix_sdk::ruma::UserId| name.clone().unwrap_or_else(|| id.localpart().to_owned());
+    let who = |name: &Option<String>, id: &matrix_sdk::ruma::UserId| {
+        name.clone().unwrap_or_else(|| id.localpart().to_owned())
+    };
     let target_name = ev.content.displayname.clone();
     let target = who(&target_name, &ev.state_key);
     let sender_name = match room.get_member_no_sync(&ev.sender).await {
@@ -1471,24 +1789,37 @@ async fn membership_line(room: &Room, ev: &matrix_sdk::ruma::events::room::membe
         C::Unbanned => format!("{sender_name} unbanned {target}"),
         C::KickedAndBanned => format!("{sender_name} removed and banned {target}"),
         C::Knocked => format!("{target} asked to join"),
-        C::ProfileChanged { displayname_change, avatar_url_change } => {
-            match (displayname_change, avatar_url_change) {
-                (Some(c), _) => {
-                    let old = c.old.map(str::to_owned).unwrap_or_else(|| ev.state_key.localpart().to_owned());
-                    let new = c.new.map(str::to_owned).unwrap_or_else(|| ev.state_key.localpart().to_owned());
-                    format!("{old} is now known as {new}")
-                }
-                (None, Some(_)) => format!("{target} changed their avatar"),
-                _ => return None,
+        C::ProfileChanged {
+            displayname_change,
+            avatar_url_change,
+        } => match (displayname_change, avatar_url_change) {
+            (Some(c), _) => {
+                let old = c
+                    .old
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| ev.state_key.localpart().to_owned());
+                let new = c
+                    .new
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| ev.state_key.localpart().to_owned());
+                format!("{old} is now known as {new}")
             }
-        }
+            (None, Some(_)) => format!("{target} changed their avatar"),
+            _ => return None,
+        },
         _ => return None,
     };
     Some(text)
 }
 
 fn role_of(power: i64) -> &'static str {
-    if power >= 100 { "admin" } else if power >= 50 { "moderator" } else { "member" }
+    if power >= 100 {
+        "admin"
+    } else if power >= 50 {
+        "moderator"
+    } else {
+        "member"
+    }
 }
 
 fn power_i64(p: matrix_sdk::ruma::events::room::power_levels::UserPowerLevel) -> i64 {
@@ -1509,17 +1840,18 @@ impl Core {
         let client = room.client();
         let me = client.user_id().ok_or_else(|| anyhow!("no user id"))?;
         let own = room.get_member_no_sync(me).await.ok().flatten();
-        let (can_invite, can_kick, can_ban, can_set_name, can_set_topic, can_redact_other) = match own {
-            Some(m) => (
-                m.can_invite(),
-                m.can_kick(),
-                m.can_ban(),
-                m.can_send_state(matrix_sdk::ruma::events::StateEventType::RoomName),
-                m.can_send_state(matrix_sdk::ruma::events::StateEventType::RoomTopic),
-                m.can_redact_other(),
-            ),
-            None => (false, false, false, false, false, false),
-        };
+        let (can_invite, can_kick, can_ban, can_set_name, can_set_topic, can_redact_other) =
+            match own {
+                Some(m) => (
+                    m.can_invite(),
+                    m.can_kick(),
+                    m.can_ban(),
+                    m.can_send_state(matrix_sdk::ruma::events::StateEventType::RoomName),
+                    m.can_send_state(matrix_sdk::ruma::events::StateEventType::RoomTopic),
+                    m.can_redact_other(),
+                ),
+                None => (false, false, false, false, false, false),
+            };
         use matrix_sdk::ruma::room::JoinRuleKind as J;
         let join_rule = match room.join_rule().map(|r| r.kind()) {
             Some(J::Public) => "public",
@@ -1529,9 +1861,14 @@ impl Core {
             _ => "other",
         }
         .to_owned();
-        let encrypted = room.latest_encryption_state().await.map(|s| s.is_encrypted()).unwrap_or(false);
+        let encrypted = room
+            .latest_encryption_state()
+            .await
+            .map(|s| s.is_encrypted())
+            .unwrap_or(false);
         let direct = room.is_direct().await.unwrap_or(false);
-        let (notification_mode, notification_custom) = self.notification_mode(&room, encrypted, direct).await;
+        let (notification_mode, notification_custom) =
+            self.notification_mode(&room, encrypted, direct).await;
         Ok(RoomDetails {
             id: room.room_id().to_string(),
             name,
@@ -1569,7 +1906,11 @@ impl Core {
             if let Ok(page) = room.messages(opts).await {
                 for ev in page.chunk {
                     if let Ok(AnySyncTimelineEvent::MessageLike(m)) = ev.raw().deserialize() {
-                        if matches!(m, AnySyncMessageLikeEvent::RoomMessage(_) | AnySyncMessageLikeEvent::RoomEncrypted(_)) {
+                        if matches!(
+                            m,
+                            AnySyncMessageLikeEvent::RoomMessage(_)
+                                | AnySyncMessageLikeEvent::RoomEncrypted(_)
+                        ) {
                             let ts = u64::from(m.origin_server_ts().0);
                             best = Some(best.map_or(ts, |b| b.max(ts)));
                             break;
@@ -1584,15 +1925,40 @@ impl Core {
 
     /// The room's effective notification mode and whether it is room-specific.
     async fn settings(&self) -> Result<matrix_sdk::notification_settings::NotificationSettings> {
-        self.state.lock().await.notification_settings.clone().ok_or_else(|| anyhow!("not logged in"))
+        self.state
+            .lock()
+            .await
+            .notification_settings
+            .clone()
+            .ok_or_else(|| anyhow!("not logged in"))
     }
 
-    async fn notification_mode(&self, room: &Room, encrypted: bool, direct: bool) -> (String, bool) {
-        use matrix_sdk::notification_settings::{IsEncrypted, IsOneToOne, RoomNotificationMode as M};
-        let Ok(settings) = self.settings().await else { return ("all".to_owned(), false) };
-        let (mode, custom) = match settings.get_user_defined_room_notification_mode(room.room_id()).await {
+    async fn notification_mode(
+        &self,
+        room: &Room,
+        encrypted: bool,
+        direct: bool,
+    ) -> (String, bool) {
+        use matrix_sdk::notification_settings::{
+            IsEncrypted, IsOneToOne, RoomNotificationMode as M,
+        };
+        let Ok(settings) = self.settings().await else {
+            return ("all".to_owned(), false);
+        };
+        let (mode, custom) = match settings
+            .get_user_defined_room_notification_mode(room.room_id())
+            .await
+        {
             Some(m) => (m, true),
-            None => (settings.get_default_room_notification_mode(IsEncrypted::from(encrypted), IsOneToOne::from(direct)).await, false),
+            None => (
+                settings
+                    .get_default_room_notification_mode(
+                        IsEncrypted::from(encrypted),
+                        IsOneToOne::from(direct),
+                    )
+                    .await,
+                false,
+            ),
         };
         let name = match mode {
             M::AllMessages => "all",
@@ -1607,10 +1973,26 @@ impl Core {
         let room = self.room(room_id).await?;
         let settings = self.settings().await?;
         let result = match mode {
-            "all" => settings.set_room_notification_mode(room.room_id(), M::AllMessages).await,
-            "mentions" => settings.set_room_notification_mode(room.room_id(), M::MentionsAndKeywordsOnly).await,
-            "mute" => settings.set_room_notification_mode(room.room_id(), M::Mute).await,
-            "default" => settings.delete_user_defined_room_rules(room.room_id()).await,
+            "all" => {
+                settings
+                    .set_room_notification_mode(room.room_id(), M::AllMessages)
+                    .await
+            }
+            "mentions" => {
+                settings
+                    .set_room_notification_mode(room.room_id(), M::MentionsAndKeywordsOnly)
+                    .await
+            }
+            "mute" => {
+                settings
+                    .set_room_notification_mode(room.room_id(), M::Mute)
+                    .await
+            }
+            "default" => {
+                settings
+                    .delete_user_defined_room_rules(room.room_id())
+                    .await
+            }
             other => bail!("unknown mode {other}; use all, mentions, mute or default"),
         };
         match result {
@@ -1628,8 +2010,15 @@ impl Core {
     /// Server-side search covers unencrypted rooms. Encrypted rooms are
     /// scanned locally through their decrypted history, a bounded number of
     /// pages back, so a search there means "the recent past", not all time.
-    pub(crate) async fn search(&self, query: &str, room_id: Option<&str>, limit: u32) -> Result<SearchResults> {
-        use matrix_sdk::ruma::api::client::search::search_events::v3::{Categories, Criteria, Request};
+    pub(crate) async fn search(
+        &self,
+        query: &str,
+        room_id: Option<&str>,
+        limit: u32,
+    ) -> Result<SearchResults> {
+        use matrix_sdk::ruma::api::client::search::search_events::v3::{
+            Categories, Criteria, Request,
+        };
         let client = self.client().await?;
         let q = query.trim();
         if q.is_empty() {
@@ -1638,12 +2027,20 @@ impl Core {
         let limit = limit.clamp(1, 200) as usize;
         let rooms: Vec<Room> = match room_id {
             Some(id) => vec![self.room(id).await?],
-            None => client.joined_rooms().into_iter().filter(|r| !r.is_space()).collect(),
+            None => client
+                .joined_rooms()
+                .into_iter()
+                .filter(|r| !r.is_space())
+                .collect(),
         };
         let mut plain: Vec<matrix_sdk::ruma::OwnedRoomId> = Vec::new();
         let mut encrypted: Vec<Room> = Vec::new();
         for r in rooms {
-            if r.latest_encryption_state().await.map(|s| s.is_encrypted()).unwrap_or(false) {
+            if r.latest_encryption_state()
+                .await
+                .map(|s| s.is_encrypted())
+                .unwrap_or(false)
+            {
                 encrypted.push(r);
             } else {
                 plain.push(r.room_id().to_owned());
@@ -1659,7 +2056,9 @@ impl Core {
             criteria.filter.limit = Some(UInt::from(limit as u32));
             let mut cats = Categories::new();
             cats.room_events = Some(criteria);
-            match tokio::time::timeout(MESSAGE_SEARCH_TIMEOUT, client.send(Request::new(cats))).await {
+            match tokio::time::timeout(MESSAGE_SEARCH_TIMEOUT, client.send(Request::new(cats)))
+                .await
+            {
                 Ok(Ok(resp)) => {
                     for r in resp.search_categories.room_events.results {
                         let Some(raw) = r.result else { continue };
@@ -1677,8 +2076,16 @@ impl Core {
                             let room = client.get_room(&m.room_id);
                             let (room_name, sender_name) = match &room {
                                 Some(room) => (
-                                    room.display_name().await.map(|n| n.to_string()).unwrap_or_else(|_| m.room_id.to_string()),
-                                    room.get_member_no_sync(&m.sender).await.ok().flatten().map(|mm| mm.name().to_owned()).unwrap_or_else(|| m.sender.localpart().to_owned()),
+                                    room.display_name()
+                                        .await
+                                        .map(|n| n.to_string())
+                                        .unwrap_or_else(|_| m.room_id.to_string()),
+                                    room.get_member_no_sync(&m.sender)
+                                        .await
+                                        .ok()
+                                        .flatten()
+                                        .map(|mm| mm.name().to_owned())
+                                        .unwrap_or_else(|| m.sender.localpart().to_owned()),
                                 ),
                                 None => (m.room_id.to_string(), m.sender.localpart().to_owned()),
                             };
@@ -1704,16 +2111,25 @@ impl Core {
         let mut scanned_messages = 0u32;
         let pages_per_room = if room_id.is_some() { 12 } else { 3 };
         for room in &encrypted {
-            let room_name = room.display_name().await.map(|n| n.to_string()).unwrap_or_else(|_| room.room_id().to_string());
+            let room_name = room
+                .display_name()
+                .await
+                .map(|n| n.to_string())
+                .unwrap_or_else(|_| room.room_id().to_string());
             let mut from: Option<String> = None;
             for _ in 0..pages_per_room {
                 let mut opts = MessagesOptions::backward();
                 opts.limit = UInt::from(100u32);
                 opts.from = from.clone();
-                let Ok(page) = room.messages(opts).await else { break };
+                let Ok(page) = room.messages(opts).await else {
+                    break;
+                };
                 let raw_count = page.chunk.len();
                 for ev in page.chunk {
-                    if let Ok(AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::RoomMessage(SyncMessageLikeEvent::Original(m)))) = ev.raw().deserialize() {
+                    if let Ok(AnySyncTimelineEvent::MessageLike(
+                        AnySyncMessageLikeEvent::RoomMessage(SyncMessageLikeEvent::Original(m)),
+                    )) = ev.raw().deserialize()
+                    {
                         if matches!(m.content.relates_to, Some(Relation::Replacement(_))) {
                             continue;
                         }
@@ -1722,7 +2138,13 @@ impl Core {
                         let edited = bundled_edit(ev.raw()).map(|(b, _)| b);
                         let body = edited.as_deref().unwrap_or_else(|| m.content.body());
                         if body.to_lowercase().contains(&needle) {
-                            let sender_name = room.get_member_no_sync(&m.sender).await.ok().flatten().map(|mm| mm.name().to_owned()).unwrap_or_else(|| m.sender.localpart().to_owned());
+                            let sender_name = room
+                                .get_member_no_sync(&m.sender)
+                                .await
+                                .ok()
+                                .flatten()
+                                .map(|mm| mm.name().to_owned())
+                                .unwrap_or_else(|| m.sender.localpart().to_owned());
                             hits.push(SearchHit {
                                 room: room.room_id().to_string(),
                                 room_name: room_name.clone(),
@@ -1748,7 +2170,42 @@ impl Core {
         hits.sort_by(|a, b| b.ts.cmp(&a.ts));
         hits.dedup_by(|a, b| a.event_id == b.event_id);
         hits.truncate(limit);
-        Ok(SearchResults { hits, scanned_rooms: encrypted.len() as u32, scanned_messages, server_rooms })
+        Ok(SearchResults {
+            hits,
+            scanned_rooms: encrypted.len() as u32,
+            scanned_messages,
+            server_rooms,
+        })
+    }
+
+    /// Link preview through the homeserver (it fetches the page, not us).
+    pub(crate) async fn preview(&self, url: &str) -> Result<LinkPreview> {
+        let client = self.client().await?;
+        let url = url.trim();
+        if !(url.starts_with("http://") || url.starts_with("https://")) {
+            bail!("only http(s) links can be previewed");
+        }
+        let raw = tokio::time::timeout(SEARCH_TIMEOUT, client.media().get_media_preview(url, None))
+            .await
+            .map_err(|_| anyhow!("the preview did not arrive in time"))?
+            .context("fetching preview")?;
+        let v: serde_json::Value = match raw {
+            Some(r) => serde_json::from_str(r.get()).context("reading preview")?,
+            None => serde_json::Value::Null,
+        };
+        let get = |k: &str| {
+            v.get(k)
+                .and_then(|x| x.as_str())
+                .map(|x| x.trim().to_owned())
+                .filter(|x| !x.is_empty())
+        };
+        Ok(LinkPreview {
+            url: url.to_owned(),
+            title: get("og:title"),
+            description: get("og:description").map(|d| d.chars().take(300).collect()),
+            site: get("og:site_name"),
+            image: get("og:image").filter(|i| i.starts_with("mxc://")),
+        })
     }
 
     pub(crate) async fn spaces(&self) -> Result<Vec<SpaceInfo>> {
@@ -1764,7 +2221,10 @@ impl Core {
                 Err(_) => room.room_id().to_string(),
             };
             let mut children = Vec::new();
-            if let Ok(events) = room.get_state_events_static::<SpaceChildEventContent>().await {
+            if let Ok(events) = room
+                .get_state_events_static::<SpaceChildEventContent>()
+                .await
+            {
                 for ev in events {
                     use matrix_sdk::deserialized_responses::SyncOrStrippedState;
                     // A child with an empty `via` has been removed from the space.
@@ -1777,19 +2237,36 @@ impl Core {
                     }
                 }
             }
-            out.push(SpaceInfo { id: room.room_id().to_string(), name, avatar: room.avatar_url().map(|u| u.to_string()), children });
+            out.push(SpaceInfo {
+                id: room.room_id().to_string(),
+                name,
+                avatar: room.avatar_url().map(|u| u.to_string()),
+                children,
+            });
         }
         out.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
         Ok(out)
     }
 
-    pub(crate) async fn members(&self, room_id: &str, query: &str, limit: u32) -> Result<Vec<MemberInfo>> {
+    pub(crate) async fn members(
+        &self,
+        room_id: &str,
+        query: &str,
+        limit: u32,
+    ) -> Result<Vec<MemberInfo>> {
         let room = self.room(room_id).await?;
-        let members = room.members(matrix_sdk::RoomMemberships::JOIN).await.context("loading members")?;
+        let members = room
+            .members(matrix_sdk::RoomMemberships::JOIN)
+            .await
+            .context("loading members")?;
         let q = query.trim().to_lowercase();
         let mut out: Vec<MemberInfo> = members
             .iter()
-            .filter(|m| q.is_empty() || m.name().to_lowercase().contains(&q) || m.user_id().as_str().to_lowercase().contains(&q))
+            .filter(|m| {
+                q.is_empty()
+                    || m.name().to_lowercase().contains(&q)
+                    || m.user_id().as_str().to_lowercase().contains(&q)
+            })
             .map(|m| {
                 let power = power_i64(m.power_level());
                 MemberInfo {
@@ -1801,18 +2278,29 @@ impl Core {
                 }
             })
             .collect();
-        out.sort_by(|a, b| b.power.cmp(&a.power).then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase())));
+        out.sort_by(|a, b| {
+            b.power
+                .cmp(&a.power)
+                .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+        });
         out.truncate(limit.clamp(1, 2000) as usize);
         Ok(out)
     }
 
     /// Small square avatar into the media cache, keyed by the mxc URL.
-    pub(crate) async fn avatar(&self, url: &str) -> Result<String> {
+    pub(crate) async fn avatar(&self, url: &str, size: u32) -> Result<String> {
         let client = self.client().await?;
         let mxc = matrix_sdk::ruma::OwnedMxcUri::from(url);
-        mxc.validate().map_err(|e| anyhow!("invalid avatar url: {e}"))?;
+        mxc.validate()
+            .map_err(|e| anyhow!("invalid avatar url: {e}"))?;
+        let size = size.clamp(16, 640);
         let dir = crate::media::avatar_cache_dir()?;
-        let path = dir.join(format!("{}.png", crate::media::hash_of(url)));
+        // The default size keeps its historical file name so existing caches stay valid.
+        let path = if size == 96 {
+            dir.join(format!("{}.png", crate::media::hash_of(url)))
+        } else {
+            dir.join(format!("{}-{size}.png", crate::media::hash_of(url)))
+        };
         if path.exists() {
             return Ok(path.to_string_lossy().into_owned());
         }
@@ -1821,10 +2309,12 @@ impl Core {
             .get_media_content(
                 &matrix_sdk::media::MediaRequestParameters {
                     source: matrix_sdk::ruma::events::room::MediaSource::Plain(mxc),
-                    format: matrix_sdk::media::MediaFormat::Thumbnail(matrix_sdk::media::MediaThumbnailSettings::new(
-                        UInt::from(96u32),
-                        UInt::from(96u32),
-                    )),
+                    format: matrix_sdk::media::MediaFormat::Thumbnail(
+                        matrix_sdk::media::MediaThumbnailSettings::new(
+                            UInt::from(size),
+                            UInt::from(size),
+                        ),
+                    ),
                 },
                 true,
             )
@@ -1841,16 +2331,27 @@ async fn reply_preview(room: &Room, event_id: &matrix_sdk::ruma::EventId) -> Opt
     let parsed: AnySyncTimelineEvent = ev.raw().deserialize().ok()?;
     let edited = bundled_edit(ev.raw()).map(|(b, _)| b);
     let (sender, body) = match parsed {
-        AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::RoomMessage(SyncMessageLikeEvent::Original(m))) => {
+        AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::RoomMessage(
+            SyncMessageLikeEvent::Original(m),
+        )) => {
             let text = match crate::media::attachment_of(&m.content.msgtype) {
-                Some(a) => format!("{} {}", match a.kind.as_str() { "image" => "🖼", "video" => "🎞", "audio" => "🎵", _ => "📎" }, a.caption.unwrap_or(a.name)),
+                Some(a) => format!(
+                    "{} {}",
+                    match a.kind.as_str() {
+                        "image" => "🖼",
+                        "video" => "🎞",
+                        "audio" => "🎵",
+                        _ => "📎",
+                    },
+                    a.caption.unwrap_or(a.name)
+                ),
                 None => edited.unwrap_or_else(|| strip_reply_fallback(m.content.body())),
             };
             (m.sender, text)
         }
-        AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::RoomEncrypted(SyncMessageLikeEvent::Original(e))) => {
-            (e.sender, "Unable to decrypt".to_owned())
-        }
+        AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::RoomEncrypted(
+            SyncMessageLikeEvent::Original(e),
+        )) => (e.sender, "Unable to decrypt".to_owned()),
         _ => return None,
     };
     let sender_name = match room.get_member_no_sync(&sender).await {
@@ -1858,8 +2359,17 @@ async fn reply_preview(room: &Room, event_id: &matrix_sdk::ruma::EventId) -> Opt
         _ => sender.localpart().to_owned(),
     };
     let one_line: String = body.split_whitespace().collect::<Vec<_>>().join(" ");
-    let body = if one_line.chars().count() > 160 { format!("{}…", one_line.chars().take(160).collect::<String>()) } else { one_line };
-    Some(ReplyPreview { event_id: event_id.to_string(), sender: sender.to_string(), sender_name, body })
+    let body = if one_line.chars().count() > 160 {
+        format!("{}…", one_line.chars().take(160).collect::<String>())
+    } else {
+        one_line
+    };
+    Some(ReplyPreview {
+        event_id: event_id.to_string(),
+        sender: sender.to_string(),
+        sender_name,
+        body,
+    })
 }
 
 /// Write a file readable only by this user, replacing any previous content.
