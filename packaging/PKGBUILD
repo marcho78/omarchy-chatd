@@ -2,7 +2,7 @@
 #
 # Builds omarchy-yapperd from the git checkout this file lives in. Install with:
 #
-#   git clone https://github.com/marcho78/omarchy-yapperd && cd omarchy-yapperd/packaging && makepkg -si
+#   git clone https://github.com/marcho78/omarchy-yapperd && cd omarchy-yapperd && git checkout "$(git tag -l 'v*' --sort=-v:refname | head -1)" && cd packaging && makepkg -si
 #
 # Nothing is downloaded except crates, pinned by Cargo.lock. The binary you
 # install is compiled from the committed source you can read one level up.

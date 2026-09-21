@@ -25,7 +25,7 @@ same stack as Element X. This daemon adds no cryptography of its own.
 No binaries are shipped. You build it from this source with `makepkg`:
 
 ```bash
-git clone https://github.com/marcho78/omarchy-yapperd && cd omarchy-yapperd/packaging && makepkg -si
+git clone https://github.com/marcho78/omarchy-yapperd && cd omarchy-yapperd && git checkout "$(git tag -l 'v*' --sort=-v:refname | head -1)" && cd packaging && makepkg -si
 ```
 
 `makepkg -s` installs `cargo` from the Arch repos if it is missing, builds the
@@ -42,7 +42,7 @@ systemctl --user enable --now omarchy-yapperd
 
 | | |
 |---|---|
-| Update | `git pull && cd packaging && makepkg -si` |
+| Update | `git fetch --tags && git checkout "$(git tag -l 'v*' --sort=-v:refname | head -1)" && cd packaging && makepkg -si` — or press Update in Yapper |
 | Remove | `pacman -R omarchy-yapperd`, then `rm -rf ~/.local/share/omarchy-yapperd` to drop the session and keys |
 | Logs | `journalctl --user -u omarchy-yapperd -f` |
 
