@@ -80,9 +80,14 @@ token on the server and deletes both entries.
 refuses to start while the first answers on the socket. The unit runs with
 `NoNewPrivileges`, `PrivateTmp` and `ProtectSystem=full`.
 
-**Known gaps** (see Roadmap): the store passphrase sits in `session.json`
-instead of the keyring, and this device is not yet cross-signed, so other
-clients show it as unverified.
+**Verification.** `setup_recovery` creates the account's cross-signing
+identity (signing this device), secret storage and key backup, and returns
+the recovery key once. `verify_request` runs SAS emoji verification against
+another of the user's devices; incoming requests are announced and never
+auto-accepted. `recover` restores the secrets on a new device from the key.
+
+**Known gap** (see Roadmap): the store passphrase sits in `session.json`
+instead of the keyring.
 
 ## Socket protocol
 
@@ -98,6 +103,19 @@ the response echoes.
 | `timeline` | `room`, `limit` (default 50, max 200) | `[message]`, oldest first |
 | `send` | `room`, `body` | `{event_id}` |
 | `mark_read` | `room`, `event_id` | `{}` |
+| `search_rooms` | `query`, `server?`, `limit` | `[{id, name, alias?, topic?, members, joined}]` |
+| `join` | `room` (alias or id) | room info |
+| `search_users` | `query`, `limit` | `[{id, name?}]` |
+| `dm` | `user` | room info (existing DM or a new encrypted one) |
+| `create_room` | `name`, `topic?`, `encrypted`, `private` | room info |
+| `invites` | | `[{room, name, inviter?, inviter_name?, direct}]` |
+| `accept_invite` / `decline_invite` / `leave` | `room` | |
+| `verification_status` | | `{device_verified, cross_signing, recovery, backup, device_id, other_devices}` |
+| `verify_request` | | `{flow_id}` — asks our other devices; progress as `verification` events |
+| `verify_accept` / `verify_confirm` / `verify_cancel` | `flow_id` | |
+| `recover` | `key` | verification status |
+| `setup_recovery` | | `{recovery_key}` — first device: cross-signing, secret storage, backup |
+| `reset_recovery_key` | | `{recovery_key}` — the old key stops working |
 
 Responses: `{"id":…, "ok":true, "result":…}` or `{"id":…, "ok":false, "error":"…"}`.
 
@@ -112,10 +130,15 @@ Unsolicited events; the first line on every new connection is a `state`:
 |---|---|---|
 | `state` | connect, login, logout, sync start/stop, sync error | the status fields |
 | `message` | a message arrives in a joined room | a message |
+| `invite` | we were invited | `{room, name, inviter?, inviter_name?, direct}` |
+| `rooms_changed` | our own membership changed | |
+| `verification` | a verification flow moved | `{flow_id, other_user, other_device?, outgoing, state, emojis?, reason?}` — state is requested, ready, emoji, confirmed, done or cancelled |
+| `verification_status_changed` | identity, backup or recovery changed | |
 
 Sending into an encrypted room encrypts automatically; the SDK shares the
 room key with every device in the room first. Messages the daemon has no key
-for are skipped in `timeline` (they will be readable once key backup lands).
+for come back with `msgtype: "unable_to_decrypt"`; they fill in once key
+backup or another device supplies the key.
 
 Try it by hand:
 
@@ -160,12 +183,9 @@ package builds `--frozen`.
 
 ## Roadmap
 
-1. **Device verification** — SAS emoji against another device, and recovery
-   key entry. Until then other clients show this device as unverified.
-2. **Key backup** — read history from before this device signed in, and
-   survive a reinstall.
+1. Attachments (encrypted uploads and downloads).
+2. Scrollback, read markers, replies, edits.
 3. **Keyring** — store passphrase in the Secret Service instead of `session.json`.
-4. Attachments (encrypted uploads), typing, reactions, replies, invites.
 
 ## License
 

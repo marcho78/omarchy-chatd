@@ -114,6 +114,8 @@ pub struct Core {
     data_dir: PathBuf,
     events: broadcast::Sender<Event>,
     state: tokio::sync::Mutex<State>,
+    /// Verification flows we are tracking: flow id -> other user.
+    pub(crate) flows: tokio::sync::Mutex<std::collections::HashMap<String, matrix_sdk::ruma::OwnedUserId>>,
 }
 
 #[derive(Clone)]
@@ -128,7 +130,7 @@ impl Core {
             .mode(0o700)
             .create(&data_dir)
             .with_context(|| format!("creating {}", data_dir.display()))?;
-        Ok(Arc::new(Self { data_dir, events, state: Default::default() }))
+        Ok(Arc::new(Self { data_dir, events, state: Default::default(), flows: Default::default() }))
     }
 
     pub fn events(&self) -> &broadcast::Sender<Event> {
@@ -228,6 +230,26 @@ impl Core {
                 Ok(serde_json::to_value(self.room_info(&room).await)?)
             }
             Command::Invites => Ok(serde_json::to_value(self.invites().await?)?),
+            Command::VerificationStatus => Ok(serde_json::to_value(self.verification_status().await?)?),
+            Command::VerifyRequest => {
+                let flow_id = self.verify_request().await?;
+                Ok(json!({ "flow_id": flow_id }))
+            }
+            Command::VerifyAccept { flow_id } => { self.verify_accept(&flow_id).await?; Ok(json!({})) }
+            Command::VerifyConfirm { flow_id } => { self.verify_confirm(&flow_id).await?; Ok(json!({})) }
+            Command::VerifyCancel { flow_id } => { self.verify_cancel(&flow_id).await?; Ok(json!({})) }
+            Command::Recover { key } => {
+                self.recover(&key).await?;
+                Ok(serde_json::to_value(self.verification_status().await?)?)
+            }
+            Command::SetupRecovery => {
+                let key = self.setup_recovery().await?;
+                Ok(json!({ "recovery_key": key }))
+            }
+            Command::ResetRecoveryKey => {
+                let key = self.reset_recovery_key().await?;
+                Ok(json!({ "recovery_key": key }))
+            }
             Command::AcceptInvite { room } => {
                 let room = self.room(&room).await?;
                 room.join().await.context("accepting invite")?;
@@ -260,7 +282,7 @@ impl Core {
         let _ = self.events.send(Event::State(self.status().await));
     }
 
-    async fn client(&self) -> Result<Client> {
+    pub(crate) async fn client(&self) -> Result<Client> {
         self.state.lock().await.client.clone().ok_or_else(|| anyhow!("not logged in"))
     }
 
@@ -471,6 +493,7 @@ impl Core {
         client.add_event_handler(on_room_message);
         client.add_event_handler(on_stripped_member);
         client.add_event_handler(on_member);
+        crate::verify::install_handlers(self, &client);
 
         let core = self.clone();
         let sync_client = client.clone();
@@ -727,13 +750,33 @@ impl Core {
         for ev in page.chunk {
             let encrypted = ev.encryption_info().is_some();
             let Ok(parsed) = ev.raw().deserialize() else { continue };
-            let AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::RoomMessage(
-                SyncMessageLikeEvent::Original(msg),
-            )) = parsed
-            else {
-                continue;
-            };
-            out.push(to_message(&room, msg, encrypted).await);
+            match parsed {
+                AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::RoomMessage(
+                    SyncMessageLikeEvent::Original(msg),
+                )) => out.push(to_message(&room, msg, encrypted).await),
+                // Still encrypted: we have no key (yet). Show a placeholder so
+                // the gap is visible; backup or key sharing may fill it later.
+                AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::RoomEncrypted(
+                    SyncMessageLikeEvent::Original(enc),
+                )) => {
+                    let sender_name = match room.get_member_no_sync(&enc.sender).await {
+                        Ok(Some(m)) => m.name().to_owned(),
+                        _ => enc.sender.localpart().to_owned(),
+                    };
+                    out.push(Message {
+                        room: room.room_id().to_string(),
+                        event_id: enc.event_id.to_string(),
+                        sender: enc.sender.to_string(),
+                        sender_name,
+                        body: "Unable to decrypt this message".to_owned(),
+                        html: None,
+                        msgtype: "unable_to_decrypt".to_owned(),
+                        ts: enc.origin_server_ts.0.into(),
+                        encrypted: true,
+                    });
+                }
+                _ => {}
+            }
         }
         out.reverse(); // backward pagination yields newest first
         Ok(out)

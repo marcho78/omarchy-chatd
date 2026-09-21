@@ -2315,6 +2315,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "futures-util",
  "libc",
  "matrix-sdk",
  "rand 0.10.3",

@@ -80,6 +80,25 @@ pub enum Command {
     },
     /// Pending invitations.
     Invites,
+    /// Cross-signing / backup / recovery state and our other devices.
+    VerificationStatus,
+    /// Ask our other devices to verify this one (SAS emoji). Progress
+    /// arrives as `verification` events keyed by `flow_id`.
+    VerifyRequest,
+    /// Accept an incoming request (from another of our devices or a user).
+    VerifyAccept { flow_id: String },
+    /// The emoji matched on both sides.
+    VerifyConfirm { flow_id: String },
+    /// They did not match, or the user gave up.
+    VerifyCancel { flow_id: String },
+    /// Restore cross-signing and backup secrets with the recovery key.
+    Recover { key: String },
+    /// First device: set up cross-signing, secret storage and backup.
+    /// Returns the recovery key, shown once.
+    SetupRecovery,
+    /// Replace the recovery key with a new one (the old one stops working).
+    /// Returns the new key, shown once.
+    ResetRecoveryKey,
     AcceptInvite { room: String },
     DeclineInvite { room: String },
     Leave { room: String },
@@ -128,6 +147,56 @@ pub enum Event {
     /// Our own membership changed somewhere (joined, left, kicked): the
     /// room list should be fetched again.
     RoomsChanged,
+    /// A verification flow changed state.
+    Verification(VerificationInfo),
+    /// Cross-signing or backup state changed; fetch verification_status.
+    VerificationStatusChanged,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct VerificationInfo {
+    pub flow_id: String,
+    pub other_user: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub other_device: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub other_device_name: Option<String>,
+    /// Whether we started it.
+    pub outgoing: bool,
+    /// requested | ready | emoji | confirmed | done | cancelled
+    pub state: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub emojis: Vec<EmojiInfo>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct EmojiInfo {
+    pub symbol: String,
+    pub description: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct VerificationStatus {
+    /// This device is signed by our own cross-signing identity.
+    pub device_verified: bool,
+    /// The account has a cross-signing identity at all.
+    pub cross_signing: bool,
+    /// unknown | enabled | disabled | incomplete
+    pub recovery: String,
+    /// unknown | enabled | disabled | creating | enabling | resuming | downloading
+    pub backup: String,
+    pub device_id: String,
+    pub other_devices: Vec<DeviceInfo>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DeviceInfo {
+    pub id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    pub verified: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]

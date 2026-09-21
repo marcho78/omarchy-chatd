@@ -7,6 +7,7 @@
 
 mod core;
 mod protocol;
+mod verify;
 
 use std::{io::IsTerminal, os::unix::fs::PermissionsExt, path::PathBuf, sync::Arc};
 

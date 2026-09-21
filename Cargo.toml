@@ -14,6 +14,7 @@ path = "src/main.rs"
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
+futures-util = { version = "0.3", default-features = false }
 libc = "0.2"
 # Default features: e2e-encryption, automatic-room-key-forwarding, sqlite, rustls.
 # local-server: loopback HTTP listener for the OAuth redirect.
