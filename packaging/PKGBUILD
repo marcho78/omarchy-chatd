@@ -1,8 +1,8 @@
 # Maintainer: marcho78
 #
 # Builds omarchy-yapperd as a pacman package from the git checkout this file
-# lives in. The Yapper plugin does not need this: it builds the daemon into
-# ~/.local/bin itself. For a system package, check out a release tag and:
+# lives in. The Yapper plugin offers this as "Build from source"; the
+# prebuilt alternative is bin/PKGBUILD. Check out a release tag and:
 #
 #   cd packaging && makepkg -si
 #

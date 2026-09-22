@@ -1,0 +1,34 @@
+# Maintainer: marcho78
+#
+# Installs the omarchy-yapperd binary that the daemon's GitHub Actions
+# workflow (.github/workflows/release.yml) built for this release, verified
+# against the sha256 recorded here. No compile, no Rust toolchain. To build
+# from source instead use ../PKGBUILD; the two packages replace each other.
+#
+#   cd packaging/bin && makepkg -si
+
+pkgname=omarchy-yapperd-bin
+_pkgname=omarchy-yapperd
+pkgver=0.21.1
+pkgrel=1
+pkgdesc="End-to-end encrypted Matrix daemon behind the Yapper plugin (prebuilt)"
+arch=(x86_64 aarch64)
+url="https://github.com/marcho78/omarchy-yapperd"
+license=(MIT)
+depends=(gcc-libs glibc sqlite)
+provides=("$_pkgname=$pkgver")
+conflicts=("$_pkgname" omarchy-chatd)
+options=(!strip) # stripped by the release workflow
+source_x86_64=("$url/releases/download/v$pkgver/$_pkgname-$pkgver-x86_64.tar.gz")
+source_aarch64=("$url/releases/download/v$pkgver/$_pkgname-$pkgver-aarch64.tar.gz")
+# Written by scripts/release.sh from the SHA256SUMS the workflow publishes.
+sha256sums_x86_64=('SKIP')
+sha256sums_aarch64=('SKIP')
+
+package() {
+  cd "$_pkgname-$pkgver-$CARCH"
+  install -Dm755 omarchy-yapperd "$pkgdir/usr/bin/omarchy-yapperd"
+  install -Dm644 omarchy-yapperd.service "$pkgdir/usr/lib/systemd/user/omarchy-yapperd.service"
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+  install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
+}
