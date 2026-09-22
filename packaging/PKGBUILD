@@ -1,8 +1,10 @@
 # Maintainer: marcho78
 #
-# Builds omarchy-yapperd from the git checkout this file lives in. Install with:
+# Builds omarchy-yapperd as a pacman package from the git checkout this file
+# lives in. The Yapper plugin does not need this: it builds the daemon into
+# ~/.local/bin itself. For a system package, check out a release tag and:
 #
-#   git clone https://github.com/marcho78/omarchy-yapperd && cd omarchy-yapperd && git checkout "$(git tag -l 'v*' --sort=-v:refname | head -1)" && cd packaging && makepkg -si
+#   cd packaging && makepkg -si
 #
 # Nothing is downloaded except crates, pinned by Cargo.lock. The binary you
 # install is compiled from the committed source you can read one level up.
@@ -15,7 +17,9 @@ arch=(x86_64 aarch64)
 url="https://github.com/marcho78/omarchy-yapperd"
 license=(MIT)
 depends=(gcc-libs glibc sqlite)
-makedepends=(cargo git)
+# `rust`, not the virtual `cargo`: naming the provider spares makepkg the
+# "rust or rustup?" question.
+makedepends=(rust git)
 # Earlier name of this package.
 conflicts=(omarchy-chatd)
 replaces=(omarchy-chatd)
