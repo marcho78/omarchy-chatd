@@ -9,7 +9,7 @@
 
 pkgname=omarchy-yapperd-bin
 _pkgname=omarchy-yapperd
-pkgver=0.21.1
+pkgver=0.22.0
 pkgrel=1
 pkgdesc="End-to-end encrypted Matrix daemon behind the Yapper plugin (prebuilt)"
 arch=(x86_64 aarch64)
