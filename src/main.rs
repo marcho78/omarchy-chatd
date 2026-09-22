@@ -113,6 +113,7 @@ async fn main() -> Result<()> {
             _ = int.recv() => break,
         }
     }
+    core.shutdown().await;
     let _ = std::fs::remove_file(&socket);
     info!("stopped");
     Ok(())

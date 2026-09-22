@@ -1031,6 +1031,31 @@ impl Core {
         Ok(())
     }
 
+    /// Orderly stop for the process: end the sync loop and any pending
+    /// sign-in, then release the client so its SQLite stores checkpoint
+    /// and close. Without this the stores are left with -wal and -shm
+    /// files that the next start has to recover.
+    pub async fn shutdown(self: &Arc<Self>) {
+        let (client, task, pending) = {
+            let mut st = self.state.lock().await;
+            st.notification_settings = None;
+            st.syncing = false;
+            (st.client.take(), st.sync_task.take(), st.pending.take())
+        };
+        if let Some(task) = task {
+            task.abort();
+            let _ = task.await;
+        }
+        if let Some(p) = pending {
+            p.task.abort();
+            let _ = p.task.await;
+        }
+        drop(client);
+        // Tasks the client spawned (event handlers, send queue) let go of
+        // their handles as they wind down; give them a moment.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    }
+
     async fn logout(self: &Arc<Self>) -> Result<()> {
         let (client, task, pending) = {
             let mut st = self.state.lock().await;
