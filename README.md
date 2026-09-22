@@ -22,17 +22,33 @@ same stack as Element X. This daemon adds no cryptography of its own.
 
 ## Install
 
-No binaries are shipped. You build it from this source with `makepkg`:
+Two pacman packages, both from this repository, both pinned to a release.
+The Yapper plugin offers them from its panel; by hand:
+
+**Prebuilt** (`omarchy-yapperd-bin`, about a minute). The Release workflow
+in `.github/workflows/release.yml` builds the daemon on GitHub's x86_64 and
+aarch64 runners for every `vX.Y.Z` tag and attaches the tarballs, a
+`SHA256SUMS` file and a build provenance attestation to the GitHub release.
+`packaging/bin/PKGBUILD` downloads the tarball for your architecture and
+checks it against the sha256 recorded in the PKGBUILD:
 
 ```bash
-git clone https://github.com/marcho78/omarchy-yapperd && cd omarchy-yapperd && git checkout "$(git tag -l 'v*' --sort=-v:refname | head -1)" && cd packaging && makepkg -si
+git clone https://github.com/marcho78/omarchy-yapperd && cd omarchy-yapperd && git checkout "$(git tag -l 'pkg-v*' --sort=-v:refname | head -1)" && cd packaging/bin && makepkg -si
 ```
 
-`makepkg -s` installs `cargo` from the Arch repos if it is missing, builds the
-daemon (several minutes the first time — matrix-rust-sdk is large), and
-`-i` installs the resulting pacman package. The package contains the binary,
-a systemd user unit, this README and the license; it depends only on
-`gcc-libs`, `glibc` and `sqlite`.
+**From source** (`omarchy-yapperd`, 10 to 25 minutes). `packaging/PKGBUILD`
+compiles the checked-out source; `makepkg -s` installs `rust` and `git`
+from the Arch repos if they are missing:
+
+```bash
+git clone https://github.com/marcho78/omarchy-yapperd && cd omarchy-yapperd && git checkout "$(git tag -l 'pkg-v*' --sort=-v:refname | head -1)" && cd packaging && makepkg -si
+```
+
+The `pkg-vX.Y.Z` tag marks the packaging commit of a release: the same
+tree as `vX.Y.Z` plus the checksums for its binaries. The two packages
+replace each other. Either contains the binary, a systemd user unit, this
+README and the license, and depends only on `gcc-libs`, `glibc` and
+`sqlite`.
 
 The Yapper plugin starts the daemon on demand. To run it at login instead:
 
@@ -42,14 +58,23 @@ systemctl --user enable --now omarchy-yapperd
 
 | | |
 |---|---|
-| Update | `git fetch --tags && git checkout "$(git tag -l 'v*' --sort=-v:refname | head -1)" && cd packaging && makepkg -si` — or press Update in Yapper |
-| Remove | `pacman -R omarchy-yapperd`, then `rm -rf ~/.local/share/omarchy-yapperd` to drop the session and keys |
+| Update | check out the newest `pkg-v*` tag and run `makepkg -si` in the same package directory — or press Update in Yapper |
+| Stop | `systemctl --user stop omarchy-yapperd` — or Quit Yapper in the plugin's rail. The daemon closes its stores and removes its socket on the way out; nothing needs cleaning up before a start or a reinstall. |
 | Logs | `journalctl --user -u omarchy-yapperd -f` |
 
+### Uninstall
+
+```bash
+systemctl --user disable --now omarchy-yapperd
+sudo pacman -R omarchy-yapperd-bin        # or omarchy-yapperd, whichever pacman -Q shows
+rm -rf ~/.local/share/omarchy-yapperd     # session, encrypted stores; keys not backed up are lost
+rm -rf ~/.cache/omarchy-yapper            # the plugin's checkout and build directory
+```
+
+The Yapper plugin's Settings › Daemon › Remove runs the same steps.
+
 Why not the AUR? It is a distribution channel, not a trust mechanism; the
-`PKGBUILD` here does exactly what an AUR helper would do, minus the lookup. If
-the package appears in the AUR or the Omarchy package repository later, the
-same `PKGBUILD` ships there.
+`PKGBUILD`s here do exactly what an AUR helper would do, minus the lookup.
 
 ## Security model
 
@@ -208,9 +233,12 @@ socat - UNIX-CONNECT:$XDG_RUNTIME_DIR/omarchy-yapper.sock   # or interactively
 
 ## Releases
 
-`scripts/release.sh X.Y.Z` bumps the version in `Cargo.toml`, `Cargo.lock` and the
-`PKGBUILD`, commits, tags `vX.Y.Z` and pushes. The Yapper plugin checks the
-newest `v*` tag against the running daemon's version and offers the update.
+`scripts/release.sh X.Y.Z` needs a `## [X.Y.Z]` section in `CHANGELOG.md`.
+It bumps the version in `Cargo.toml`, `Cargo.lock` and both PKGBUILDs,
+commits, tags `vX.Y.Z` and pushes; waits for the Release workflow; writes the
+published `SHA256SUMS` into `packaging/bin/PKGBUILD`; commits that and tags it
+`pkg-vX.Y.Z`. The Yapper plugin pins that commit and checks the newest
+`pkg-v*` tag against the running daemon's version to offer updates.
 
 ## Development
 

@@ -6,6 +6,17 @@ All notable changes to omarchy-yapperd. The format follows
 
 ## [Unreleased]
 
+## [1.0.0]
+
+### Fixed
+- On stop the daemon now ends the sync loop and closes its SQLite stores
+  before exiting, so no `-wal` and `-shm` files are left for the next start
+  to recover.
+
+### Changed
+- First stable release; the plugin's install, update and removal flows are
+  built around the two packages (`omarchy-yapperd`, `omarchy-yapperd-bin`).
+
 ## [0.22.0]
 
 ### Added
@@ -29,7 +40,8 @@ All notable changes to omarchy-yapperd. The format follows
 ### Added
 - Omarchy community space, directory browsing, bounded request retries.
 
-[Unreleased]: https://github.com/marcho78/omarchy-yapperd/compare/v0.22.0...HEAD
+[Unreleased]: https://github.com/marcho78/omarchy-yapperd/compare/v1.0.0...HEAD
+[1.0.0]: https://github.com/marcho78/omarchy-yapperd/compare/v0.22.0...v1.0.0
 [0.22.0]: https://github.com/marcho78/omarchy-yapperd/compare/v0.21.1...v0.22.0
 [0.21.1]: https://github.com/marcho78/omarchy-yapperd/compare/v0.21.0...v0.21.1
 [0.21.0]: https://github.com/marcho78/omarchy-yapperd/compare/v0.20.0...v0.21.0
