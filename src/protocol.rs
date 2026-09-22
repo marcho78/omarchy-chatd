@@ -187,6 +187,69 @@ pub enum Command {
         #[serde(default)]
         thread: Option<String>,
     },
+    // ---- the Omarchy community ----
+    /// Everything about the community space at once.
+    CommunityStatus {
+        alias: String,
+    },
+    /// Join the space and its rooms.
+    CommunityJoin {
+        alias: String,
+    },
+    /// Withdraw the card and leave the space and its rooms.
+    CommunityLeave {
+        alias: String,
+    },
+    /// Publish or update our card in the space.
+    PublishProfile {
+        alias: String,
+        #[serde(default)]
+        bio: String,
+        #[serde(default)]
+        open_to_dm: bool,
+        #[serde(default)]
+        theme: Option<String>,
+    },
+    ClearProfile {
+        alias: String,
+    },
+    /// Members who published a card.
+    People {
+        alias: String,
+        #[serde(default)]
+        query: String,
+        #[serde(default = "default_limit")]
+        limit: u32,
+    },
+    /// Block / unblock a user everywhere (m.ignored_user_list).
+    Ignore {
+        user: String,
+    },
+    Unignore {
+        user: String,
+    },
+    Ignored,
+    /// Who may open a direct chat with us; `community` names the space
+    /// used by the `community` policy.
+    SetDmPolicy {
+        policy: crate::community::DmPolicy,
+        #[serde(default)]
+        community: String,
+    },
+    /// Admin tooling: a public space, and listing rooms under it.
+    CreateSpace {
+        name: String,
+        #[serde(default)]
+        topic: Option<String>,
+        #[serde(default)]
+        alias: Option<String>,
+    },
+    AddSpaceChild {
+        space: String,
+        room: String,
+        #[serde(default)]
+        suggested: bool,
+    },
     /// Search a server's public room directory (our own homeserver unless
     /// `server` names another).
     SearchRooms {
@@ -195,6 +258,18 @@ pub enum Command {
         server: Option<String>,
         #[serde(default = "default_search_limit")]
         limit: u32,
+    },
+    /// Browse a server's public room directory a page at a time, most
+    /// joined first; `since` continues from a previous page's `next`.
+    Explore {
+        #[serde(default)]
+        query: String,
+        #[serde(default)]
+        server: Option<String>,
+        #[serde(default = "default_explore_limit")]
+        limit: u32,
+        #[serde(default)]
+        since: Option<String>,
     },
     /// Join a room by `#alias:server` or `!id:server`.
     Join {
@@ -285,6 +360,10 @@ pub enum Command {
 
 fn default_limit() -> u32 {
     50
+}
+
+fn default_explore_limit() -> u32 {
+    30
 }
 
 fn default_search_limit() -> u32 {
@@ -425,8 +504,23 @@ pub struct DirectoryRoom {
     pub alias: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub topic: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub avatar: Option<String>,
     pub members: u64,
     pub joined: bool,
+}
+
+/// One page of a public room directory.
+#[derive(Debug, Clone, Serialize)]
+pub struct DirectoryPage {
+    pub server: String,
+    pub rooms: Vec<DirectoryRoom>,
+    /// Pass as `since` for the page after this one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next: Option<String>,
+    /// The server's estimate of how many public rooms it lists.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize)]

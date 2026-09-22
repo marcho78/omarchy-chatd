@@ -7,6 +7,7 @@
 //! connection is checked against our own uid via SO_PEERCRED.
 
 mod bridge;
+mod community;
 mod core;
 mod media;
 mod protocol;

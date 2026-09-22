@@ -131,6 +131,18 @@ the response echoes.
 | `spaces` | | `[{id, name, avatar?, children}]` — joined spaces (excluded from `rooms`) |
 | `search` | `query`, `room?`, `limit` | `{hits: [{room, room_name, event_id, sender, sender_name, body, ts}], server_rooms, scanned_rooms, scanned_messages}` — server search for unencrypted rooms, a bounded local scan of decrypted history for encrypted ones |
 | `preview` | `url` (http/https) | `{url, title?, description?, site?, image?}` — Open Graph data fetched by the homeserver (`image` is an mxc for `avatar`) |
+| `explore` | `query?`, `server?`, `limit` (default 30, max 100), `since?` | `{server, rooms: [{id, name, alias?, topic?, avatar?, members, joined}], next?, total?}` — one page of a public room directory, most joined first; an empty query lists everything; pass `next` as `since` for the following page |
+| `community_status` | `alias` | `{alias, exists, joined, space_id?, name?, topic?, member_count, rooms: [{id, name, topic?, joined, members}], profile?, dm_policy, joining}` — the space's listing is cached for 5 minutes (a refusal for 1); `joining` counts rooms the background joiner still has to join |
+| `community_join` | `alias` | status — joins the space (one request) and returns; the rooms under it are joined one at a time in the background, 5 s apart, honouring the server's `retry_after` on a 429 |
+| `community_leave` | `alias` | `{}` — withdraws the card, leaves the rooms and the space; refused when you are the space's only member (an empty room can never be joined again) |
+| `publish_profile` | `alias`, `bio?`, `open_to_dm?`, `theme?` | the card — an `org.omarchy.profile` state event keyed on your user id in the space; only you can write it |
+| `clear_profile` | `alias` | `{}` — withdraws the card |
+| `people` | `alias`, `query?`, `limit` | `[{user_id, name, avatar?, bio, open_to_dm, theme?, updated}]` — members who published a card, newest first |
+| `ignore` / `unignore` | `user` | `{}` — the account's ignore list (`m.ignored_user_list`), honoured by every client |
+| `ignored` | — | `[user_id]` |
+| `set_dm_policy` | `policy` (`anyone` \| `community` \| `contacts` \| `nobody`), `community?` (space alias) | the saved prefs — persisted in `<data_dir>/prefs.json` and enforced on incoming direct-chat invites even while the shell is closed |
+| `create_space` | `name`, `topic?`, `alias?` | `{id}` — a public, world-readable space whose members may publish cards |
+| `add_space_child` | `space`, `room`, `suggested?` | `{}` — lists a room under a space |
 | `mark_read` | `room`, `event_id`, `thread?` (root id: a threaded receipt for that thread instead of the room's marker) | `{}` |
 | `search_rooms` | `query`, `server?`, `limit` | `[{id, name, alias?, topic?, members, joined}]` |
 | `join` | `room` (alias or id) | room info |

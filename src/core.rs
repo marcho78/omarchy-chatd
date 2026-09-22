@@ -67,10 +67,10 @@ use tracing::{info, warn};
 use url::Url;
 
 use crate::protocol::{
-    Command, DirectoryRoom, DirectoryUser, Event, InviteInfo, LinkPreview, MemberInfo, Message,
-    MessageEdit, Reaction, ReactionEvent, ReactionSender, ReceiptInfo, Redaction, ReplyPreview,
-    Request, Response, RoomDetails, RoomInfo, SearchHit, SearchResults, SpaceInfo, Status,
-    ThreadInfo, TimelinePage, TypingInfo, UserRef,
+    Command, DirectoryPage, DirectoryRoom, DirectoryUser, Event, InviteInfo, LinkPreview,
+    MemberInfo, Message, MessageEdit, Reaction, ReactionEvent, ReactionSender, ReceiptInfo,
+    Redaction, ReplyPreview, Request, Response, RoomDetails, RoomInfo, SearchHit, SearchResults,
+    SpaceInfo, Status, ThreadInfo, TimelinePage, TypingInfo, UserRef,
 };
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -163,12 +163,17 @@ pub struct Core {
     /// room -> timestamp of its latest message: seeded from the server the
     /// first time a room is listed, then kept current by incoming events.
     activity: Arc<tokio::sync::Mutex<std::collections::HashMap<String, u64>>>,
+    /// DM policy and community space, persisted in `<data_dir>/prefs.json`.
+    prefs: Arc<tokio::sync::Mutex<crate::community::Prefs>>,
+    /// Cached space hierarchy and the background joiner.
+    community: Arc<crate::community::CommunityState>,
 }
 
 #[derive(Clone)]
 struct HandlerCtx {
     events: broadcast::Sender<Event>,
     activity: Arc<tokio::sync::Mutex<std::collections::HashMap<String, u64>>>,
+    prefs: Arc<tokio::sync::Mutex<crate::community::Prefs>>,
 }
 
 impl Core {
@@ -178,13 +183,20 @@ impl Core {
             .mode(0o700)
             .create(&data_dir)
             .with_context(|| format!("creating {}", data_dir.display()))?;
+        let prefs = Arc::new(tokio::sync::Mutex::new(load_prefs(&data_dir)));
         Ok(Arc::new(Self {
             data_dir,
             events,
             state: Default::default(),
             flows: Default::default(),
             activity: Default::default(),
+            prefs,
+            community: Default::default(),
         }))
+    }
+
+    fn prefs_file(&self) -> PathBuf {
+        self.data_dir.join("prefs.json")
     }
 
     pub fn events(&self) -> &broadcast::Sender<Event> {
@@ -251,6 +263,9 @@ impl Core {
             .with_threading_support(matrix_sdk::ThreadingSupport::Enabled {
                 with_subscriptions: false,
             })
+            // A request retries a few times with the server's suggested
+            // wait, then fails; nothing blocks a socket call for minutes.
+            .request_config(matrix_sdk::config::RequestConfig::new().retry_limit(3))
             .handle_refresh_tokens()
             .sqlite_store(&saved.store_path, Some(&secrets.store_passphrase))
             .build()
@@ -535,6 +550,128 @@ impl Core {
                 self.mark_read(&room, &event_id, thread).await?;
                 Ok(json!({}))
             }
+            Command::CommunityStatus { alias } => {
+                let client = self.client().await?;
+                let prefs = self.prefs.lock().await.clone();
+                Ok(serde_json::to_value(
+                    crate::community::status(&client, &self.community, &alias, &prefs).await?,
+                )?)
+            }
+            Command::CommunityJoin { alias } => {
+                let client = self.client().await?;
+                let space = crate::community::join_space(&client, &self.community, &alias).await?;
+                let prefs = {
+                    let mut p = self.prefs.lock().await;
+                    p.community = alias.clone();
+                    write_private(&self.prefs_file(), &serde_json::to_vec(&*p)?)?;
+                    p.clone()
+                };
+                // The rooms follow in the background; one joiner at a time.
+                let mut joiner = self.community.joiner.lock().await;
+                if joiner.as_ref().is_none_or(|t| t.is_finished()) {
+                    *joiner = Some(tokio::spawn(crate::community::join_rooms(
+                        client.clone(),
+                        self.community.clone(),
+                        alias.clone(),
+                        space.room_id().to_owned(),
+                        self.events.clone(),
+                    )));
+                }
+                drop(joiner);
+                let _ = self.events.send(Event::RoomsChanged);
+                Ok(serde_json::to_value(
+                    crate::community::status(&client, &self.community, &alias, &prefs).await?,
+                )?)
+            }
+            Command::CommunityLeave { alias } => {
+                let client = self.client().await?;
+                crate::community::leave(&client, &self.community, &alias).await?;
+                let _ = self.events.send(Event::RoomsChanged);
+                Ok(json!({}))
+            }
+            Command::PublishProfile {
+                alias,
+                bio,
+                open_to_dm,
+                theme,
+            } => {
+                let client = self.client().await?;
+                Ok(serde_json::to_value(
+                    crate::community::publish_profile(&client, &alias, bio, open_to_dm, theme)
+                        .await?,
+                )?)
+            }
+            Command::ClearProfile { alias } => {
+                let client = self.client().await?;
+                crate::community::clear_profile(&client, &alias).await?;
+                Ok(json!({}))
+            }
+            Command::People {
+                alias,
+                query,
+                limit,
+            } => {
+                let client = self.client().await?;
+                Ok(serde_json::to_value(
+                    crate::community::people(&client, &alias, &query, limit as usize).await?,
+                )?)
+            }
+            Command::Ignore { user } => {
+                let client = self.client().await?;
+                crate::community::ignore(&client, &user).await?;
+                Ok(json!({}))
+            }
+            Command::Unignore { user } => {
+                let client = self.client().await?;
+                crate::community::unignore(&client, &user).await?;
+                Ok(json!({}))
+            }
+            Command::Ignored => {
+                let client = self.client().await?;
+                Ok(serde_json::to_value(
+                    crate::community::ignored(&client).await?,
+                )?)
+            }
+            Command::SetDmPolicy { policy, community } => {
+                let mut p = self.prefs.lock().await;
+                p.dm_policy = policy;
+                if !community.is_empty() {
+                    p.community = community;
+                }
+                write_private(&self.prefs_file(), &serde_json::to_vec(&*p)?)?;
+                Ok(serde_json::to_value(&*p)?)
+            }
+            Command::CreateSpace { name, topic, alias } => {
+                let client = self.client().await?;
+                let room = crate::community::create_space(
+                    &client,
+                    &name,
+                    topic.as_deref(),
+                    alias.as_deref(),
+                )
+                .await?;
+                Ok(json!({ "id": room.room_id().to_string() }))
+            }
+            Command::AddSpaceChild {
+                space,
+                room,
+                suggested,
+            } => {
+                let client = self.client().await?;
+                let space = matrix_sdk::ruma::RoomId::parse(&space).context("invalid space id")?;
+                let room = matrix_sdk::ruma::RoomId::parse(&room).context("invalid room id")?;
+                crate::community::add_child(&client, &space, &room, suggested).await?;
+                Ok(json!({}))
+            }
+            Command::Explore {
+                query,
+                server,
+                limit,
+                since,
+            } => Ok(serde_json::to_value(
+                self.directory(&query, server.as_deref(), limit, since.as_deref())
+                    .await?,
+            )?),
             Command::SearchRooms {
                 query,
                 server,
@@ -719,6 +856,9 @@ impl Core {
             .with_threading_support(matrix_sdk::ThreadingSupport::Enabled {
                 with_subscriptions: false,
             })
+            // A request retries a few times with the server's suggested
+            // wait, then fails; nothing blocks a socket call for minutes.
+            .request_config(matrix_sdk::config::RequestConfig::new().retry_limit(3))
             .handle_refresh_tokens()
             .sqlite_store(&store_path, Some(&store_passphrase))
             .build()
@@ -924,6 +1064,7 @@ impl Core {
             warn!("event cache: {e:#}");
         }
         client.add_event_handler_context(HandlerCtx {
+            prefs: self.prefs.clone(),
             events: self.events.clone(),
             activity: self.activity.clone(),
         });
@@ -1253,37 +1394,68 @@ impl Core {
         server: Option<&str>,
         limit: u32,
     ) -> Result<Vec<DirectoryRoom>> {
+        Ok(self.directory(query, server, limit, None).await?.rooms)
+    }
+
+    /// One page of a public room directory: the server's own unless
+    /// `server` names another; an empty query lists everything, most
+    /// joined first.
+    async fn directory(
+        &self,
+        query: &str,
+        server: Option<&str>,
+        limit: u32,
+        since: Option<&str>,
+    ) -> Result<DirectoryPage> {
         let client = self.client().await?;
         let mut req = get_public_rooms_filtered::v3::Request::new();
         req.limit = Some(UInt::from(limit.clamp(1, 100)));
-        let mut filter = Filter::new();
-        filter.generic_search_term = Some(query.trim().to_owned());
-        req.filter = filter;
-        if let Some(server) = server.map(str::trim).filter(|s| !s.is_empty()) {
+        let query = query.trim();
+        if !query.is_empty() {
+            let mut filter = Filter::new();
+            filter.generic_search_term = Some(query.to_owned());
+            req.filter = filter;
+        }
+        req.since = since
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned);
+        let server = server.map(str::trim).filter(|s| !s.is_empty());
+        if let Some(server) = server {
             req.server = Some(OwnedServerName::try_from(server).context("invalid server name")?);
         }
         let resp = tokio::time::timeout(SEARCH_TIMEOUT, client.public_rooms_filtered(req))
             .await
             .map_err(|_| anyhow!("the room directory did not answer in time"))?
-            .context("searching the room directory")?;
-        Ok(resp
-            .chunk
-            .into_iter()
-            .map(|r| DirectoryRoom {
-                joined: client
-                    .get_room(&r.room_id)
-                    .is_some_and(|room| room.state() == RoomState::Joined),
-                id: r.room_id.to_string(),
-                name: r
-                    .name
-                    .clone()
-                    .or_else(|| r.canonical_alias.as_ref().map(|a| a.to_string()))
-                    .unwrap_or_else(|| r.room_id.to_string()),
-                alias: r.canonical_alias.map(|a| a.to_string()),
-                topic: r.topic,
-                members: r.num_joined_members.into(),
-            })
-            .collect())
+            .context("reading the room directory")?;
+        let own_server = client
+            .user_id()
+            .map(|u| u.server_name().to_string())
+            .unwrap_or_default();
+        Ok(DirectoryPage {
+            server: server.map(str::to_owned).unwrap_or(own_server),
+            rooms: resp
+                .chunk
+                .into_iter()
+                .map(|r| DirectoryRoom {
+                    joined: client
+                        .get_room(&r.room_id)
+                        .is_some_and(|room| room.state() == RoomState::Joined),
+                    id: r.room_id.to_string(),
+                    name: r
+                        .name
+                        .clone()
+                        .or_else(|| r.canonical_alias.as_ref().map(|a| a.to_string()))
+                        .unwrap_or_else(|| r.room_id.to_string()),
+                    alias: r.canonical_alias.map(|a| a.to_string()),
+                    topic: r.topic,
+                    avatar: r.avatar_url.map(|u| u.to_string()),
+                    members: r.num_joined_members.into(),
+                })
+                .collect(),
+            next: resp.next_batch,
+            total: resp.total_room_count_estimate.map(u64::from),
+        })
     }
 
     async fn join(&self, id_or_alias: &str) -> Result<Room> {
@@ -2213,7 +2385,29 @@ async fn on_stripped_member(
     if room.state() != RoomState::Invited {
         return;
     }
-    let _ = ctx.events.send(Event::Invite(invite_info(&room).await));
+    // The DM policy is judged here, before the client hears of the invite.
+    let info = invite_info(&room).await;
+    let prefs = ctx.prefs.lock().await.clone();
+    if let Some(inviter) = info
+        .inviter
+        .as_deref()
+        .and_then(|i| matrix_sdk::ruma::UserId::parse(i).ok())
+        && !crate::community::invite_allowed(&client, &prefs, &inviter, info.direct).await
+    {
+        info!(room = %room.room_id(), %inviter, policy = ?prefs.dm_policy, "declining a direct-chat invite");
+        if let Err(e) = room.leave().await {
+            warn!("declining the invite: {e:#}");
+        }
+        return;
+    }
+    let _ = ctx.events.send(Event::Invite(info));
+}
+
+fn load_prefs(data_dir: &Path) -> crate::community::Prefs {
+    std::fs::read_to_string(data_dir.join("prefs.json"))
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default()
 }
 
 /// Our own membership changed in a room we are in: joined, left, kicked.
