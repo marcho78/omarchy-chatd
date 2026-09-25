@@ -10,7 +10,7 @@
 # install is compiled from the committed source you can read one level up.
 
 pkgname=omarchy-yapperd
-pkgver=1.0.1
+pkgver=1.0.2
 pkgrel=1
 pkgdesc="End-to-end encrypted Matrix daemon behind the Yapper plugin"
 arch=(x86_64 aarch64)
