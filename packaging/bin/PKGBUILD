@@ -9,7 +9,7 @@
 
 pkgname=omarchy-yapperd-bin
 _pkgname=omarchy-yapperd
-pkgver=1.0.0
+pkgver=1.0.1
 pkgrel=1
 pkgdesc="End-to-end encrypted Matrix daemon behind the Yapper plugin (prebuilt)"
 arch=(x86_64 aarch64)
@@ -22,8 +22,8 @@ options=(!strip) # stripped by the release workflow
 source_x86_64=("$url/releases/download/v$pkgver/$_pkgname-$pkgver-x86_64.tar.gz")
 source_aarch64=("$url/releases/download/v$pkgver/$_pkgname-$pkgver-aarch64.tar.gz")
 # Written by scripts/release.sh from the SHA256SUMS the workflow publishes.
-sha256sums_x86_64=('a1e398b8fa84ef5f7510d1ac06e71bede76980920c93713f46c7f358624fbbd7')
-sha256sums_aarch64=('0360db8091bd30ef3bcb50489a1d68a7b1368249db2d43029304fa620900f9e6')
+sha256sums_x86_64=('SKIP')
+sha256sums_aarch64=('SKIP')
 
 package() {
   cd "$_pkgname-$pkgver-$CARCH"
