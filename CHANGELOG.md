@@ -6,6 +6,14 @@ All notable changes to omarchy-yapperd. The format follows
 
 ## [Unreleased]
 
+## [1.0.2]
+
+### Security
+- `packaging/PKGBUILD` no longer exports `RUSTUP_TOOLCHAIN=stable`, which
+  overrode the pinned `rust-toolchain.toml` and let a source build fetch a
+  moving compiler. The packaged Arch compiler, or the pinned release under
+  rustup, builds the daemon.
+
 ## [1.0.1]
 
 ### Security
@@ -64,7 +72,8 @@ All notable changes to omarchy-yapperd. The format follows
 ### Added
 - Omarchy community space, directory browsing, bounded request retries.
 
-[Unreleased]: https://github.com/marcho78/omarchy-yapperd/compare/v1.0.1...HEAD
+[Unreleased]: https://github.com/marcho78/omarchy-yapperd/compare/v1.0.2...HEAD
+[1.0.2]: https://github.com/marcho78/omarchy-yapperd/compare/v1.0.1...v1.0.2
 [1.0.1]: https://github.com/marcho78/omarchy-yapperd/compare/v1.0.0...v1.0.1
 [1.0.0]: https://github.com/marcho78/omarchy-yapperd/compare/v0.22.0...v1.0.0
 [0.22.0]: https://github.com/marcho78/omarchy-yapperd/compare/v0.21.1...v0.22.0

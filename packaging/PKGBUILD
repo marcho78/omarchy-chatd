@@ -37,7 +37,9 @@ prepare() {
 build() {
   cd "$pkgname"
   export CARGO_HOME="$srcdir/cargo-home"
-  export RUSTUP_TOOLCHAIN=stable
+  # No toolchain override: with Arch's rust package cargo is the packaged
+  # compiler; with rustup, rust-toolchain.toml at the repository root pins the
+  # exact release. Nothing here may select a moving channel.
   # Keep the builder's paths out of the binary (panic locations, debug info).
   export RUSTFLAGS="${RUSTFLAGS:-} --remap-path-prefix=$srcdir=/usr/src/$pkgname"
   cargo build --frozen --release
