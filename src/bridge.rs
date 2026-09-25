@@ -150,17 +150,18 @@ pub async fn detect(room: &Room) -> Option<BridgeInfo> {
                             protocol_of_user(&b).map(|p| p.to_owned())
                         })
                 })?;
+            let cap = |s: &str| s.chars().take(128).collect::<String>();
             let name = protocol
                 .and_then(|p| p.get("displayname"))
                 .and_then(|v| v.as_str())
-                .map(str::to_owned)
+                .map(cap)
                 .unwrap_or_else(|| display_name(&id));
             let text = |k: &str| {
                 content
                     .get(k)
                     .and_then(|v| v.get("displayname").or(v.get("id")))
                     .and_then(|v| v.as_str())
-                    .map(str::to_owned)
+                    .map(cap)
             };
             return Some(BridgeInfo {
                 protocol: id,
@@ -174,7 +175,7 @@ pub async fn detect(room: &Room) -> Option<BridgeInfo> {
                 bot: content
                     .get("bridgebot")
                     .and_then(|v| v.as_str())
-                    .map(str::to_owned),
+                    .map(cap),
                 channel: text("channel"),
             });
         }

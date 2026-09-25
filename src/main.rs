@@ -19,7 +19,7 @@ use std::{io::IsTerminal, os::unix::fs::PermissionsExt, path::PathBuf, sync::Arc
 use anyhow::{Context, Result, bail};
 use clap::Parser;
 use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     net::{UnixListener, UnixStream},
     signal::unix::{SignalKind, signal},
     sync::{broadcast, mpsc},
@@ -38,6 +38,12 @@ struct Args {
     #[arg(long)]
     data_dir: Option<PathBuf>,
 }
+
+/// A socket request line longer than this is refused; nothing legitimate comes close
+/// (send_file carries a path, not the file).
+const MAX_REQUEST_BYTES: usize = 1024 * 1024;
+/// Requests handled at the same time on one connection.
+const MAX_IN_FLIGHT: usize = 8;
 
 fn default_socket() -> Result<PathBuf> {
     let dir = std::env::var_os("XDG_RUNTIME_DIR").context("XDG_RUNTIME_DIR is not set")?;
@@ -168,15 +174,34 @@ async fn handle_conn(stream: UnixStream, core: Arc<Core>) -> Result<()> {
         let _ = tx.send(line).await;
     }
 
-    let mut lines = BufReader::new(rd).lines();
-    while let Some(line) = lines.next_line().await? {
-        if line.trim().is_empty() {
+    // One request per line, at most MAX_REQUEST_BYTES long; a longer line ends the
+    // connection. At most MAX_IN_FLIGHT requests run at once per connection.
+    let in_flight = std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_IN_FLIGHT));
+    let mut reader = BufReader::new(rd);
+    let mut line = Vec::with_capacity(4096);
+    loop {
+        line.clear();
+        let n = (&mut reader)
+            .take(MAX_REQUEST_BYTES as u64 + 1)
+            .read_until(b'\n', &mut line)
+            .await?;
+        if n == 0 {
+            break;
+        }
+        if line.len() > MAX_REQUEST_BYTES {
+            warn!("request longer than {MAX_REQUEST_BYTES} bytes; closing the connection");
+            break;
+        }
+        let text = String::from_utf8_lossy(&line).into_owned();
+        if text.trim().is_empty() {
             continue;
         }
+        let permit = in_flight.clone().acquire_owned().await?;
         let core = core.clone();
         let tx = tx.clone();
         tokio::spawn(async move {
-            let resp = core.handle(&line).await;
+            let _permit = permit;
+            let resp = core.handle(&text).await;
             let Ok(mut out) = serde_json::to_string(&resp) else {
                 return;
             };

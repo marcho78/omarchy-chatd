@@ -11,16 +11,24 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use std::{future::Future, io::Read, pin::Pin, sync::Arc, time::Duration};
+
 use anyhow::{Context, Result, anyhow, bail};
 use matrix_sdk::{
+    Client,
     attachment::{AttachmentConfig, AttachmentInfo, BaseAudioInfo, BaseFileInfo, BaseImageInfo},
-    media::{MediaEventContent, MediaThumbnailSettings},
+    media::{MediaEventContent, MediaFetcher, MediaFormat, MediaRequestParameters, MediaThumbnailSettings},
     ruma::{
         EventId, UInt,
+        api::{Metadata as _, client::authenticated_media},
         events::{
             AnySyncMessageLikeEvent, AnySyncTimelineEvent, SyncMessageLikeEvent,
-            room::message::{MessageType, TextMessageEventContent},
+            room::{
+                MediaSource,
+                message::{MessageType, TextMessageEventContent},
+            },
         },
+        media::Method,
     },
 };
 use tracing::info;
@@ -29,9 +37,194 @@ use crate::{core::Core, protocol::Attachment};
 
 const THUMB_SIZE: u32 = 640;
 const MAX_UPLOAD: u64 = 100 * 1024 * 1024;
+/// The most a single attachment download may occupy, matching the upload limit.
+const MAX_DOWNLOAD: u64 = 100 * 1024 * 1024;
+/// A server-side thumbnail is small by construction; anything past this is not one.
+const MAX_THUMBNAIL: u64 = 16 * 1024 * 1024;
+/// The whole download, connect to last byte.
+const DOWNLOAD_DEADLINE: Duration = Duration::from_secs(300);
+
+/// Downloads media in bounded pieces: the response is refused if it declares
+/// more than the cap, dropped the moment it exceeds it, and abandoned when
+/// the deadline passes. Installed on every Client the daemon builds, so the
+/// SDK's cache and thumbnail handling stay in place with its own unbounded
+/// fetch replaced. Encrypted files are decrypted after the capped download.
+#[derive(Debug, Default)]
+pub struct BoundedMediaFetcher;
+
+pub fn bounded_media_fetcher() -> Arc<dyn MediaFetcher> {
+    Arc::new(BoundedMediaFetcher)
+}
+
+fn media_error(msg: impl Into<String>) -> matrix_sdk::Error {
+    matrix_sdk::Error::UnknownError(msg.into().into())
+}
+
+impl MediaFetcher for BoundedMediaFetcher {
+    fn fetch_media_content<'a>(
+        &'a self,
+        client: &'a Client,
+        request: &'a MediaRequestParameters,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, matrix_sdk::Error>> + Send + 'a>> {
+        Box::pin(async move {
+            let (uri, encrypted) = match &request.source {
+                MediaSource::Encrypted(file) => (&file.url, Some(file.as_ref())),
+                MediaSource::Plain(uri) => (uri, None),
+            };
+            let (server, media_id) = uri.parts().map_err(|e| media_error(format!("bad mxc uri: {e}")))?;
+            // A thumbnail request for an encrypted file makes no sense server-side; fetch the file.
+            let thumbnail = match &request.format {
+                MediaFormat::Thumbnail(settings) if encrypted.is_none() => Some(settings),
+                _ => None,
+            };
+            let cap = if thumbnail.is_some() { MAX_THUMBNAIL } else { MAX_DOWNLOAD };
+
+            // The same endpoints the SDK uses: authenticated media when the server has it.
+            let versions = client.supported_versions().await?;
+            let use_auth = authenticated_media::get_content::v1::Request::PATH_BUILDER.is_supported(&versions);
+            let mut url = client.homeserver();
+            {
+                let mut segments = url
+                    .path_segments_mut()
+                    .map_err(|_| media_error("homeserver url cannot take a path"))?;
+                segments.pop_if_empty();
+                if use_auth {
+                    segments.extend(["_matrix", "client", "v1", "media"]);
+                } else {
+                    segments.extend(["_matrix", "media", "v3"]);
+                }
+                segments.push(if thumbnail.is_some() { "thumbnail" } else { "download" });
+                segments.push(server.as_str());
+                segments.push(media_id);
+            }
+            if let Some(settings) = thumbnail {
+                let method = match settings.method {
+                    Method::Crop => "crop",
+                    _ => "scale",
+                };
+                url.query_pairs_mut()
+                    .append_pair("width", &settings.width.to_string())
+                    .append_pair("height", &settings.height.to_string())
+                    .append_pair("method", method)
+                    .append_pair("animated", if settings.animated { "true" } else { "false" });
+            }
+            let mut req = client.http_client().get(url);
+            if use_auth {
+                let token = client.access_token().ok_or_else(|| media_error("not signed in"))?;
+                req = req.bearer_auth(token);
+            }
+
+            let bytes = tokio::time::timeout(DOWNLOAD_DEADLINE, async {
+                let response = req.send().await.map_err(|e| media_error(format!("download: {e}")))?;
+                let status = response.status();
+                if !status.is_success() {
+                    return Err(media_error(format!("download: server answered {status}")));
+                }
+                if let Some(len) = response.content_length()
+                    && len > cap
+                {
+                    return Err(media_error(format!("download: {len} bytes declared, the limit is {cap}")));
+                }
+                let mut response = response;
+                let mut buf: Vec<u8> = Vec::new();
+                while let Some(chunk) = response.chunk().await.map_err(|e| media_error(format!("download: {e}")))? {
+                    if buf.len() as u64 + chunk.len() as u64 > cap {
+                        return Err(media_error(format!("download: more than {cap} bytes, stopped")));
+                    }
+                    buf.extend_from_slice(&chunk);
+                }
+                Ok(buf)
+            })
+            .await
+            .map_err(|_| media_error(format!("download: no result within {} s", DOWNLOAD_DEADLINE.as_secs())))??;
+
+            info!(
+                bytes = bytes.len(),
+                thumbnail = thumbnail.is_some(),
+                encrypted = encrypted.is_some(),
+                "media downloaded within the cap"
+            );
+            let Some(file) = encrypted else { return Ok(bytes) };
+            let len = bytes.len();
+            let mut cursor = std::io::Cursor::new(bytes);
+            let mut reader = matrix_sdk_base::crypto::AttachmentDecryptor::new(&mut cursor, file.clone().into())?;
+            let mut decrypted = Vec::with_capacity(len);
+            reader.read_to_end(&mut decrypted)?;
+            Ok(decrypted)
+        })
+    }
+}
 /// ffmpeg loudness filter for voice: the usual speech target, with a
 /// true-peak ceiling so it never clips.
 const LOUDNORM: &str = "loudnorm=I=-16:TP=-1.5:LRA=11";
+/// ffmpeg by absolute path, never through PATH.
+const FFMPEG: &str = "/usr/bin/ffmpeg";
+/// The longest ffmpeg may run on one file, and the longest input it may read.
+const FFMPEG_DEADLINE: Duration = Duration::from_secs(120);
+const FFMPEG_MAX_SECONDS: &str = "900";
+/// A voice-note waveform is at most 256 samples (MSC3245).
+const MAX_WAVEFORM: usize = 256;
+
+/// Run ffmpeg on one local file with a deadline; the child is killed if the
+/// deadline passes or the future is dropped. Input demuxing is restricted to
+/// local files and `-t` bounds how much of the input is read.
+async fn run_ffmpeg(args: &[&std::ffi::OsStr], output: &Path) -> bool {
+    let mut cmd = tokio::process::Command::new(FFMPEG);
+    cmd.args(["-nostdin", "-y", "-loglevel", "error", "-protocol_whitelist", "file"])
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true);
+    let ok = match tokio::time::timeout(FFMPEG_DEADLINE, cmd.status()).await {
+        Ok(Ok(st)) => st.success(),
+        Ok(Err(e)) => {
+            tracing::warn!("ffmpeg could not run: {e}");
+            false
+        }
+        Err(_) => {
+            tracing::warn!("ffmpeg exceeded {} s on {}", FFMPEG_DEADLINE.as_secs(), output.display());
+            false
+        }
+    };
+    if !ok {
+        let _ = std::fs::remove_file(output);
+    }
+    ok
+}
+
+/// Extensions a cached attachment may carry, by kind. Anything else is .bin:
+/// the sender's declared MIME type and file name choose nothing that a
+/// desktop opener would treat as a document or executable content.
+fn safe_extension(kind: &str, sniffed_image: Option<&str>, mime: Option<&str>, filename: &str) -> String {
+    const IMAGES: &[&str] = &["png", "jpg", "jpeg", "gif", "webp", "avif", "bmp"];
+    const AUDIO: &[&str] = &["ogg", "oga", "opus", "mp3", "m4a", "aac", "flac", "wav"];
+    const VIDEO: &[&str] = &["mp4", "webm", "mkv", "mov", "m4v"];
+    const FILES: &[&str] = &["pdf", "txt", "md", "zip", "tar", "gz", "xz", "zst", "7z", "csv", "json", "log", "odt", "ods", "odp", "docx", "xlsx", "pptx", "epub"];
+    let allowed: &[&str] = match kind {
+        "image" => IMAGES,
+        "audio" => AUDIO,
+        "video" => VIDEO,
+        _ => FILES,
+    };
+    // An image is what its bytes say it is, never what the sender declared.
+    if kind == "image" {
+        return sniffed_image
+            .and_then(mime2ext::mime2ext)
+            .filter(|e| IMAGES.contains(e))
+            .unwrap_or("bin")
+            .to_owned();
+    }
+    let candidate = mime
+        .and_then(mime2ext::mime2ext)
+        .map(str::to_owned)
+        .or_else(|| Path::new(filename).extension().map(|e| e.to_string_lossy().to_lowercase()));
+    match candidate {
+        Some(e) if allowed.contains(&e.as_str()) => e,
+        _ => "bin".to_owned(),
+    }
+}
+
 
 /// What the client needs to know to render an attachment message.
 pub fn attachment_of(msgtype: &MessageType) -> Option<Attachment> {
@@ -115,6 +308,7 @@ pub fn attachment_of(msgtype: &MessageType) -> Option<Attachment> {
                 (!a.waveform.is_empty()).then(|| {
                     a.waveform
                         .iter()
+                        .take(MAX_WAVEFORM)
                         .map(|v| u16::try_from(u64::from(v.get())).unwrap_or(u16::MAX))
                         .collect::<Vec<u16>>()
                 })
@@ -162,18 +356,9 @@ pub fn hash_of(s: &str) -> String {
     format!("{:016x}", h.finish())
 }
 
-fn cache_name(event_id: &str, thumbnail: bool, mime: Option<&str>, filename: &str) -> String {
+fn cache_name(event_id: &str, thumbnail: bool, ext: &str) -> String {
     let mut h = DefaultHasher::new();
     event_id.hash(&mut h);
-    let ext = mime
-        .and_then(mime2ext::mime2ext)
-        .map(str::to_owned)
-        .or_else(|| {
-            Path::new(filename)
-                .extension()
-                .map(|e| e.to_string_lossy().into_owned())
-        })
-        .unwrap_or_else(|| "bin".to_owned());
     format!(
         "{:016x}{}.{}",
         h.finish(),
@@ -211,6 +396,7 @@ impl Core {
                     c,
                     c.filename(),
                     c.info.as_deref().and_then(|i| i.mimetype.clone()),
+                    c.info.as_deref().and_then(|i| i.size).map(u64::from),
                     thumbnail,
                 )
                 .await?
@@ -221,6 +407,7 @@ impl Core {
                     c,
                     c.filename(),
                     c.info.as_deref().and_then(|i| i.mimetype.clone()),
+                    c.info.as_deref().and_then(|i| i.size).map(u64::from),
                     thumbnail,
                 )
                 .await?
@@ -231,6 +418,7 @@ impl Core {
                     c,
                     c.filename(),
                     c.info.as_deref().and_then(|i| i.mimetype.clone()),
+                    c.info.as_deref().and_then(|i| i.size).map(u64::from),
                     thumbnail,
                 )
                 .await?
@@ -241,6 +429,7 @@ impl Core {
                     c,
                     c.filename(),
                     c.info.as_deref().and_then(|i| i.mimetype.clone()),
+                    c.info.as_deref().and_then(|i| i.size).map(u64::from),
                     false,
                 )
                 .await?
@@ -248,7 +437,18 @@ impl Core {
             _ => bail!("this message has no attachment"),
         };
 
-        let path = cache_dir()?.join(cache_name(event_id, thumbnail, Some(&mime), &name));
+        let kind = match &msg.content.msgtype {
+            MessageType::Image(_) => "image",
+            MessageType::Audio(_) => "audio",
+            MessageType::Video(_) => "video",
+            _ => "file",
+        };
+        let ext = if thumbnail {
+            safe_extension("image", infer_image_mime(&bytes).as_deref(), None, "")
+        } else {
+            safe_extension(kind, infer_image_mime(&bytes).as_deref(), Some(&mime), &name)
+        };
+        let path = cache_dir()?.join(cache_name(event_id, thumbnail, &ext));
         if !path.exists() {
             std::fs::write(&path, &bytes).with_context(|| format!("writing {}", path.display()))?;
         }
@@ -261,19 +461,16 @@ impl Core {
                     .map(|s| s.to_string_lossy())
                     .unwrap_or_default()
             ));
-            if !norm.exists() {
-                let ok = tokio::process::Command::new("ffmpeg")
-                    .args(["-y", "-loglevel", "error", "-i"])
-                    .arg(&path)
-                    .args(["-af", LOUDNORM, "-c:a", "libopus", "-b:a", "48k"])
-                    .arg(&norm)
-                    .status()
-                    .await
-                    .map(|st| st.success())
-                    .unwrap_or(false);
-                if !ok {
-                    let _ = std::fs::remove_file(&norm);
-                }
+            // Only something that is audio by its bytes goes near ffmpeg.
+            if !norm.exists() && infer::get(&bytes).is_some_and(|t| t.matcher_type() == infer::MatcherType::Audio) {
+                let input = path.as_os_str();
+                let out = norm.as_os_str();
+                let args: Vec<&std::ffi::OsStr> = vec![
+                    "-t".as_ref(), FFMPEG_MAX_SECONDS.as_ref(), "-i".as_ref(), input,
+                    "-af".as_ref(), LOUDNORM.as_ref(), "-c:a".as_ref(), "libopus".as_ref(), "-b:a".as_ref(), "48k".as_ref(),
+                    "-f".as_ref(), "ogg".as_ref(), out,
+                ];
+                run_ffmpeg(&args, &norm).await;
             }
             if norm.exists() {
                 return Ok((norm.to_string_lossy().into_owned(), "audio/ogg".to_owned()));
@@ -354,25 +551,17 @@ impl Core {
             bail!("the recording is too short");
         }
         let ogg_path = wav_path.with_extension("ogg");
-        let encoded = tokio::process::Command::new("ffmpeg")
-            .args(["-y", "-loglevel", "error", "-i"])
-            .arg(&wav_path)
-            // Speech-level loudness whatever the mic's gain was.
-            .args([
-                "-af",
-                LOUDNORM,
-                "-c:a",
-                "libopus",
-                "-b:a",
-                "32k",
-                "-application",
-                "voip",
-            ])
-            .arg(&ogg_path)
-            .status()
-            .await
-            .map(|st| st.success())
-            .unwrap_or(false);
+        // Speech-level loudness whatever the mic's gain was.
+        let encoded = {
+            let input = wav_path.as_os_str();
+            let out = ogg_path.as_os_str();
+            let args: Vec<&std::ffi::OsStr> = vec![
+                "-t".as_ref(), FFMPEG_MAX_SECONDS.as_ref(), "-f".as_ref(), "wav".as_ref(), "-i".as_ref(), input,
+                "-af".as_ref(), LOUDNORM.as_ref(), "-c:a".as_ref(), "libopus".as_ref(), "-b:a".as_ref(), "32k".as_ref(),
+                "-application".as_ref(), "voip".as_ref(), "-f".as_ref(), "ogg".as_ref(), out,
+            ];
+            run_ffmpeg(&args, &ogg_path).await
+        };
         let (data, mime, name) = if encoded {
             (
                 std::fs::read(&ogg_path).context("reading the encoded voice message")?,
@@ -486,6 +675,7 @@ async fn fetch(
     content: &impl MediaEventContent,
     filename: &str,
     mime: Option<String>,
+    declared_size: Option<u64>,
     thumbnail: bool,
 ) -> Result<(Vec<u8>, String, String)> {
     let media = client.media();
@@ -502,6 +692,11 @@ async fn fetch(
             return Ok((bytes, m, filename.to_owned()));
         }
         // No separate thumbnail (typical for encrypted images): fall through to the file.
+    }
+    if let Some(size) = declared_size
+        && size > MAX_DOWNLOAD
+    {
+        bail!("this attachment is {size} bytes; the limit is {MAX_DOWNLOAD}");
     }
     let bytes = media
         .get_file(content, true)
@@ -524,4 +719,27 @@ fn infer_image_mime(bytes: &[u8]) -> Option<String> {
         _ => return None,
     };
     Some(t.to_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::safe_extension;
+
+    #[test]
+    fn images_take_their_extension_from_the_bytes_only() {
+        assert_eq!(safe_extension("image", Some("image/png"), Some("text/html"), "x.html"), "png");
+        assert_eq!(safe_extension("image", None, Some("text/html"), "x.html"), "bin");
+        assert_eq!(safe_extension("image", Some("image/svg+xml"), None, ""), "bin");
+    }
+
+    #[test]
+    fn other_kinds_use_an_allowlist() {
+        assert_eq!(safe_extension("file", None, Some("application/pdf"), "a"), "pdf");
+        assert_eq!(safe_extension("file", None, Some("text/html"), "page.html"), "bin");
+        assert_eq!(safe_extension("file", None, None, "evil.desktop"), "bin");
+        assert_eq!(safe_extension("file", None, None, "notes.TXT"), "txt");
+        assert_eq!(safe_extension("audio", None, Some("audio/ogg"), "v"), "oga");
+        assert_eq!(safe_extension("audio", None, Some("text/x-shellscript"), "v.sh"), "bin");
+        assert_eq!(safe_extension("video", None, Some("video/mp4"), "v"), "mp4");
+    }
 }

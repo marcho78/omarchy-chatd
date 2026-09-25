@@ -82,6 +82,12 @@ const OAUTH_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const SEARCH_TIMEOUT: Duration = Duration::from_secs(20);
 /// Full-text search on a big homeserver can take a while on first use.
 const MESSAGE_SEARCH_TIMEOUT: Duration = Duration::from_secs(45);
+/// Encrypted rooms scanned locally by a search without a room, most recent first.
+const MAX_SEARCH_ROOMS: usize = 40;
+/// Reply previews kept in memory; the map is cleared when it fills.
+const MAX_REPLY_CACHE: usize = 4096;
+/// A reaction key longer than this is not an emoji.
+const MAX_REACTION_KEY: usize = 64;
 
 /// What survives a restart, written to `<data_dir>/session.json` (mode
 /// 0600). The secrets — the store passphrase and the Matrix tokens — go to
@@ -266,6 +272,8 @@ impl Core {
             // A request retries a few times with the server's suggested
             // wait, then fails; nothing blocks a socket call for minutes.
             .request_config(matrix_sdk::config::RequestConfig::new().retry_limit(3))
+            // Media downloads are capped in size and time (see media.rs).
+            .media_fetcher(crate::media::bounded_media_fetcher())
             .handle_refresh_tokens()
             .sqlite_store(&saved.store_path, Some(&secrets.store_passphrase))
             .build()
@@ -859,6 +867,8 @@ impl Core {
             // A request retries a few times with the server's suggested
             // wait, then fails; nothing blocks a socket call for minutes.
             .request_config(matrix_sdk::config::RequestConfig::new().retry_limit(3))
+            // Media downloads are capped in size and time (see media.rs).
+            .media_fetcher(crate::media::bounded_media_fetcher())
             .handle_refresh_tokens()
             .sqlite_store(&store_path, Some(&store_passphrase))
             .build()
@@ -2179,6 +2189,21 @@ async fn on_room_message(
         ..
     })) = &event.content.relates_to
     {
+        // An edit counts only when it comes from whoever wrote the original
+        // (the server checks this only for the edits it bundles itself).
+        let original_sender = room
+            .load_or_fetch_event(event_id, None)
+            .await
+            .ok()
+            .and_then(|ev| ev.raw().deserialize().ok())
+            .map(|ev: AnySyncTimelineEvent| ev.sender().to_owned());
+        if original_sender.as_deref() != Some(event.sender.as_ref()) {
+            warn!(
+                "ignoring an edit of {} by {} who did not send it",
+                event_id, event.sender
+            );
+            return;
+        }
         let html = formatted_html(&new_content.msgtype);
         forget_reply_preview(&room, event_id.as_str());
         let _ = ctx.events.send(Event::MessageEdited(MessageEdit {
@@ -2266,6 +2291,15 @@ async fn cached_relations(
         )
         .await
         .unwrap_or_default();
+    // Edits by anyone but the original sender are not edits.
+    let original_sender = match cache.find_event(event_id).await {
+        Ok(Some(ev)) => ev
+            .raw()
+            .deserialize()
+            .ok()
+            .map(|ev: AnySyncTimelineEvent| ev.sender().to_owned()),
+        _ => None,
+    };
     let mut reactions = Vec::new();
     let mut edit: Option<(u64, String, Option<String>)> = None;
     for rel in related {
@@ -2273,7 +2307,7 @@ async fn cached_relations(
             Ok(AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::Reaction(
                 SyncMessageLikeEvent::Original(r),
             ))) => reactions.push((
-                r.content.relates_to.key.clone(),
+                r.content.relates_to.key.chars().take(MAX_REACTION_KEY).collect(),
                 r.sender.clone(),
                 r.event_id.to_string(),
             )),
@@ -2281,6 +2315,9 @@ async fn cached_relations(
                 SyncMessageLikeEvent::Original(e),
             ))) => {
                 if let Some(Relation::Replacement(rep)) = &e.content.relates_to {
+                    if original_sender.as_deref() != Some(e.sender.as_ref()) {
+                        continue;
+                    }
                     let ts = u64::from(e.origin_server_ts.0);
                     if edit.as_ref().is_none_or(|(t, _, _)| ts >= *t) {
                         edit = Some((
@@ -2645,7 +2682,7 @@ async fn on_reaction(event: OriginalSyncReactionEvent, room: Room, ctx: Ctx<Hand
     let _ = ctx.events.send(Event::Reaction(ReactionEvent {
         room: room.room_id().to_string(),
         event_id: a.event_id.to_string(),
-        key: a.key.clone(),
+        key: a.key.chars().take(MAX_REACTION_KEY).collect(),
         sender: user_ref(&room, &event.sender).await,
         reaction_id: event.event_id.to_string(),
     }));
@@ -3048,11 +3085,14 @@ impl Core {
             }
         }
 
-        // Local scan for encrypted rooms: recent pages, decrypted by the SDK.
+        // Local scan for encrypted rooms: recent pages, decrypted by the SDK. The whole
+        // scan has one deadline and covers at most the most recently active rooms.
         let needle = q.to_lowercase();
         let mut scanned_messages = 0u32;
         let pages_per_room = if room_id.is_some() { 12 } else { 3 };
-        for room in &encrypted {
+        let scan_deadline = tokio::time::Instant::now() + MESSAGE_SEARCH_TIMEOUT;
+        let encrypted: Vec<Room> = encrypted.into_iter().take(MAX_SEARCH_ROOMS).collect();
+        'rooms: for room in &encrypted {
             let room_name = room
                 .display_name()
                 .await
@@ -3063,7 +3103,11 @@ impl Core {
                 let mut opts = MessagesOptions::backward();
                 opts.limit = UInt::from(100u32);
                 opts.from = from.clone();
-                let Ok(page) = room.messages(opts).await else {
+                let Ok(Ok(page)) = tokio::time::timeout_at(scan_deadline, room.messages(opts)).await else {
+                    if tokio::time::Instant::now() >= scan_deadline {
+                        warn!("local search stopped at the {} s deadline", MESSAGE_SEARCH_TIMEOUT.as_secs());
+                        break 'rooms;
+                    }
                     break;
                 };
                 let raw_count = page.chunk.len();
@@ -3143,9 +3187,9 @@ impl Core {
         };
         Ok(LinkPreview {
             url: url.to_owned(),
-            title: get("og:title"),
+            title: get("og:title").map(|t| t.chars().take(200).collect()),
             description: get("og:description").map(|d| d.chars().take(300).collect()),
-            site: get("og:site_name"),
+            site: get("og:site_name").map(|s| s.chars().take(100).collect()),
             image: get("og:image").filter(|i| i.starts_with("mxc://")),
         })
     }
@@ -3294,6 +3338,10 @@ async fn reply_preview(room: &Room, event_id: &matrix_sdk::ruma::EventId) -> Opt
     }
     let preview = build_reply_preview(room, event_id).await?;
     if let Ok(mut c) = reply_cache().lock() {
+        // Bounded: remote messages decide the keys, so the map cannot grow forever.
+        if c.len() >= MAX_REPLY_CACHE {
+            c.clear();
+        }
         c.insert(key, preview.clone());
     }
     Some(preview)

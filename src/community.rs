@@ -546,6 +546,10 @@ fn profile_from(
         return None;
     }
     let mut p: Profile = serde_json::from_value(content.clone()).ok()?;
+    // Whatever was published, the card shows at most what the publisher may write.
+    p.name = p.name.chars().take(128).collect();
+    p.bio = p.bio.chars().take(280).collect();
+    p.theme = p.theme.map(|t| t.chars().take(64).collect());
     // The state key is the authority on who this is.
     if let Some(key) = v.get("state_key").and_then(|k| k.as_str()) {
         p.user_id = key.to_owned();

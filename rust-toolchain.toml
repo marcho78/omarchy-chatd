@@ -1,0 +1,4 @@
+# The exact Rust release every build uses, locally and in the Release workflow.
+[toolchain]
+channel = "1.98.1"
+components = ["clippy"]

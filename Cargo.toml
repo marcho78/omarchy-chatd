@@ -32,6 +32,7 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "io-uti
 tracing = "0.1"
 url = "2"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+infer = "0.19"
 
 [profile.release]
 lto = "thin"
