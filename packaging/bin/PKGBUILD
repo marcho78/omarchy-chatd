@@ -22,8 +22,8 @@ options=(!strip) # stripped by the release workflow
 source_x86_64=("$url/releases/download/v$pkgver/$_pkgname-$pkgver-x86_64.tar.gz")
 source_aarch64=("$url/releases/download/v$pkgver/$_pkgname-$pkgver-aarch64.tar.gz")
 # Written by scripts/release.sh from the SHA256SUMS the workflow publishes.
-sha256sums_x86_64=('SKIP')
-sha256sums_aarch64=('SKIP')
+sha256sums_x86_64=('e3e7c5b7266a7c6c4c052e44fbb3d148a12755a56009fe5166315f6923d2c0db')
+sha256sums_aarch64=('be75ba04810cce29c0fdb44f8ac6b752a6b32fc4d14357d96056899303a892bf')
 
 package() {
   cd "$_pkgname-$pkgver-$CARCH"
